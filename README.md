@@ -7,7 +7,6 @@ Transformer 中的残差连接算子，两个 BF16 张量逐元素相加。
 ## 版本迭代
 
 ### 版本 1 — 逐元素朴素并行
-
 ```cuda
 __global__ void residual_forward_kernel1(floatX* out, const floatX* inp1, const floatX* inp2, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -27,6 +26,20 @@ __global__ void residual_forward_kernel1(floatX* out, const floatX* inp1, const 
 | 寄存器/线程 | 16 |
 
 ### 版本 2 — 128bit 向量化访存
+```cuda
+__global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const floatX* inp2, int N) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
+    if (idx < N) {
+        x128 packed_out;
+        x128 packed_inp1 = load128cs(inp1 + idx); // 输入仅读取一次，流式加载绕过L1
+        x128 packed_inp2 = load128cs(inp2 + idx);
+        for (int k = 0; k < packed_inp1.size; ++k) {
+            packed_out[k] = (floatX)((float)packed_inp1[k] + (float)packed_inp2[k]);
+        }
+        store128(out + idx, packed_out); // 输出保留在缓存，供后续算子复用
+    }
+}
+```
 
 每个线程通过 128bit 向量指令一次处理 8 个 BF16 元素（16 字节），访存指令数减少 8 倍。
 

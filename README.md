@@ -6,7 +6,7 @@ Transformer 中的残差连接算子，两个 BF16 张量逐元素相加。
 
 ## 版本迭代
 
-### 版本 1 —— 逐元素朴素并行
+### 版本 1 — 逐元素朴素并行
 每个线程处理 1 个 BF16 元素（2 字节）。
 内存事务有效载荷低，总线利用率不足。
 ```cuda
@@ -24,7 +24,7 @@ __global__ void residual_forward_kernel1(floatX* out, const floatX* inp1, const 
 | 带宽利用率 | 17.22% |
 | 寄存器/线程 | 16 |
 
-### 版本 2 —— 128bit 向量化访存
+### 版本 2 — 128bit 向量化访存
 每个线程通过 128bit 向量指令一次处理 8 个 BF16 元素（16 字节），访存指令数减少 8 倍。
 ```cuda
 __global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const floatX* inp2, int N) {
@@ -49,7 +49,7 @@ __global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const 
 
 **整体性能提升 6.0 倍**，带宽利用率从 17% 提升至 95%，接近显存带宽理论峰值。
 
-![性能对比](residual_ncu.png)
+![性能对比](images/residual_ncu.png)
 
 ## 优化原理
 

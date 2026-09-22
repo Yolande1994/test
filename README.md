@@ -20,8 +20,9 @@ __global__ void residual_forward_kernel1(floatX* out, const floatX* inp1, const 
 
 | 指标 | 数值 |
 |------|------|
-| 耗时 | 468.51 μs |
-| 带宽利用率 | 17.22% |
+| 最优 block_size | 128 |
+| 耗时 | 136.26 μs |
+| 带宽利用率 | 57.75% |
 | 寄存器/线程 | 16 |
 
 ### 版本 2 — 128bit 向量化访存
@@ -43,13 +44,14 @@ __global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const 
 
 | 指标 | 数值 |
 |------|------|
+| 最优 block_size | 1024 |
 | 耗时 | 77.98 μs |
 | 带宽利用率 | 95.15% |
 | 寄存器/线程 | 22 |
 
-**整体性能提升 6.0 倍**，带宽利用率从 17% 提升至 95%，接近显存带宽理论峰值。
+**整体性能提升 1.75 倍**，带宽利用率从 58% 提升至 95%，接近显存带宽理论峰值。
 
-![性能对比](images/residual_ncu.png)
+![性能对比](residual_ncu.png)
 
 ## 优化原理
 

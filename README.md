@@ -14,6 +14,7 @@ __global__ void residual_forward_kernel1(floatX* out, const floatX* inp1, const 
         out[idx] = (floatX)((float)inp1[idx] + (float)inp2[idx]);
     }
 }
+```
 
 每个线程处理 1 个 BF16 元素（2 字节）。
 内存事务有效载荷低，总线利用率不足。

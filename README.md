@@ -11,6 +11,13 @@ Transformer 中的残差连接算子，两个 BF16 张量逐元素相加。
 每个线程处理 1 个 BF16 元素（2 字节）。
 内存事务有效载荷低，总线利用率不足。
 
+__global__ void residual_forward_kernel1(floatX* out, const floatX* inp1, const floatX* inp2, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {
+        out[idx] = (floatX)((float)inp1[idx] + (float)inp2[idx]);
+    }
+}
+
 | 指标 | 数值 |
 |------|------|
 | 耗时 | 468.51 μs |
@@ -42,13 +49,11 @@ Warp 内 32 个线程同时访问内存时，硬件会将连续地址合并为�
 
 ### 2. 流式加载（`load128cs`）
 
-残差输入只读一次就被消费，使用 `cs`（cache streaming）策略绕过 L1 缓存，
-避免污染缓存空间，把 L1 留给后续需要复用的算子。
+残差输入只读一次就被消费，使用 `cs`（cache streaming）策略绕过 L1 缓存，避免污染缓存空间，把 L1 留给后续需要复用的算子。
 
 ### 3. 大 block 调度
 
-block_size=1024 时带宽利用率最高（95.15%），大 block 能更好地摊薄线程调度开销，
-填充 SM 执行流水线。
+block_size=1024 时带宽利用率最高（95.15%），大 block 能更好地摊薄线程调度开销，填充 SM 执行流水线。
 
 ## 后续优化方向
 

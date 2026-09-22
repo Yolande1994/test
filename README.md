@@ -49,7 +49,7 @@ __global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const 
 
 **整体性能提升 6.0 倍**，带宽利用率从 17% 提升至 95%，接近显存带宽理论峰值。
 
-![性能对比](assets/residual_ncu.png)
+![性能对比](residual_ncu.png)
 
 ## 优化原理
 

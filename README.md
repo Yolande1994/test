@@ -51,7 +51,7 @@ __global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const 
 
 **整体性能提升 1.75 倍**，带宽利用率从 58% 提升至 95%，接近显存带宽理论峰值。
 
-![性能对比](residual_ncu.png)
+![性能对比](images/residual_ncu.png)
 
 ## 优化原理
 
@@ -74,5 +74,5 @@ block_size=1024 时带宽利用率最高（95.15%），大 block 能更好地摊
 
 单算子层面已接近显存带宽物理上限（剩余空间约 3%~5%），更高收益的优化方向为：
 
-- **算子融合**：与 LayerNorm / 矩阵乘融合，消除中间显存读写
+- **算子融合**：与 LayerNorm / 矩阵乘 等融合，消除中间显存读写
 - **跨步写优化**：配合后续算子的访问模式调整存储布局

@@ -35,7 +35,7 @@ __global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const 
         x128 packed_inp1 = load128cs(inp1 + idx); // 输入仅读取一次，流式加载绕过L1
         x128 packed_inp2 = load128cs(inp2 + idx);
         for (int k = 0; k < packed_inp1.size; ++k) {
-            packed_out[k] = (floatX)((float)packed_inp1[k] + (float)packed_inp2[k]);
+            packed_out[k] = (floatX)((float)packed_inp1[k] + (float)packed_inp2[k]);  // 输入BF16→计算FP32→输出BF16，避免低精度累加损失
         }
         store128(out + idx, packed_out); // 输出保留在缓存，供后续算子复用
     }

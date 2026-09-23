@@ -1,8 +1,8 @@
 # Residual Forward — 残差连接
 
-Transformer 中的残差连接算子，两个 BF16 张量逐元素相加。
+Transformer 中的残差连接算子，实现两个张量的逐元素相加（out = inp1 + inp2）
 
-典型的**访存绑定型算子**（2读1写，计算量可忽略），核心优化目标是打满显存带宽。
+典型的**访存受限型算子（Memory-Bound）**（2读1写，计算量可忽略），核心优化目标是打满显存带宽（Memory Throughput）。
 
 ## 版本迭代
 
@@ -26,13 +26,13 @@ __global__ void residual_forward_kernel1(floatX* out, const floatX* inp1, const 
 | 寄存器/线程 | 16 |
 
 ### 版本 2 — 128bit 向量化访存
-每个线程通过 128bit 向量指令一次处理 8 个 BF16 元素（16 字节），访存指令数减少 8 倍。
+每个线程通过 128bit 向量指令（x128）一次处理 8 个 BF16 元素（16 字节），访存指令数减少 8 倍。
 ```cuda
 __global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const floatX* inp2, int N) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
     if (idx < N) {
         x128 packed_out;
-        x128 packed_inp1 = load128cs(inp1 + idx); // 输入仅读取一次，流式加载绕过L1
+        x128 packed_inp1 = load128cs(inp1 + idx); // 输入仅读取一次，流式加载
         x128 packed_inp2 = load128cs(inp2 + idx);
         for (int k = 0; k < packed_inp1.size; ++k) {
             packed_out[k] = (floatX)((float)packed_inp1[k] + (float)packed_inp2[k]);  // 输入BF16→计算FP32→输出BF16，避免低精度累加损失
@@ -58,22 +58,23 @@ __global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const 
 
 ### 1. 128bit 向量化访存
 
-Warp 内 32 个线程同时访问内存时，硬件会将连续地址合并为一个内存事务。
+向量化的核心价值是提升指令发射端效率。
 
-- **v1**：每线程读 2 字节，一个 32 字节的内存事务只用到 2 字节，**浪费 15/16**
-- **v2**：每线程读 16 字节，32 个线程拼满 512 字节，**一次事务全部有效**
+- **v1**：每线程仅处理 2 字节，全量数据需 8 倍访存指令，指令发射、warp 调度与地址译码的固定开销被放大，SM 发射槽利用率低，显存总线长期半空闲。
+- **v2**：每线程处理 16 字节，访存指令总数减少 8 倍，固定开销大幅摊薄，SM 指令发射效率显著提升，最终将显存带宽拉满至接近硬件上限。
 
-### 2. 流式加载（`load128cs`）
+### 2. 流式加载（`__ldcs`）
 
-残差输入只读一次就被消费，使用 `cs`（cache streaming）策略绕过 L1 缓存，避免污染缓存空间，把 L1 留给后续需要复用的算子。
+残差连接的输入数据（inp1 和 inp2）在计算完成后便不再被本算子复用。若使用默认加载策略，这些一次性数据会占用宝贵的 L1/L2 缓存空间。
+这里使用了 load128cs（Cache Streaming）。该指令会将加载的数据标记为 "evict-first"（优先驱逐），在数据被消费后迅速腾出缓存空间。避免对 L1 缓存造成污染，为后续操作留出了缓存余量。
 
-### 3. 大 block 调度
+### 3. 混合精度计算（BF16 → FP32 → BF16）
 
-block_size=1024 时带宽利用率最高（95.15%），大 block 能更好地摊薄线程调度开销，填充 SM 执行流水线。
+代码在计算过程中将 BF16 张量提升为 FP32 进行加法运算，然后再转换回 BF16 输出。
+这种策略在保持访存带宽减半（BF16 优势）的同时，避免了低精度加法可能带来的累积误差，兼顾了性能与数值稳定性。
 
 ## 后续优化方向
 
-单算子层面已接近显存带宽物理上限（剩余空间约 3%~5%），更高收益的优化方向为：
+单算子层面已接近显存带宽物理上限（受限于 DRAM 刷新、读写切换和 ECC 开销，剩余空间不足 5%），更高收益的优化方向为**算子融合**：
 
-- **算子融合**：与 LayerNorm / 矩阵乘 等融合，消除中间显存读写
-- **跨步写优化**：配合后续算子的访问模式调整存储布局
+- 当前残差连接需要独立占用 3 次访存（2读1写）。若后续算子为 LayerNorm / GEMM，可将其融合其中，直接在寄存器内完成加法，消除中间显存读写。

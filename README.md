@@ -80,7 +80,7 @@ __global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const 
 
 **原理分析：**
 
-**1**.Occupancy 并非性能指标：Occupancy 是隐藏内存延迟的工具。对于纯访存受限（Memory-Bound）算子，一旦活跃 Warp 数量足以填满 LSU 和 DRAM 的请求队列（Saturation Point），额外的 Occupancy 只会增加队列拥塞，不会提升带宽。
+**1.** Occupancy 并非性能指标：Occupancy 是隐藏内存延迟的工具。对于纯访存受限（Memory-Bound）算子，一旦活跃 Warp 数量足以填满 LSU 和 DRAM 的请求队列（Saturation Point），额外的 Occupancy 只会增加队列拥塞，不会提升带宽。
 
 **2**.摊薄 Block 调度开销：Block 128 会启动 6144 个 Block，而 Block 1024 仅启动 768 个。大 Block 显著减少了 GigaThread 调度开销、上下文切换和 Block 频繁退役带来的流水线气泡。
 

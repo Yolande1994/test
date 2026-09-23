@@ -73,17 +73,18 @@ __global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const 
 
 ## 补充说明
 为什么 66% 的 Occupancy 能跑赢 100%？
+
+在版本2的调优中，有个反直觉的现象：Block Size = 1024 的实测耗时（77.98 μs）优于 Block Size = 128（79.52 μs），但前者的理论 Occupancy 仅为 66.67%，后者高达 100%。
+
 ![版本2 Occupancy 对比](images/residual_ncu2.png)
 
-在版本2的调优中，有一个反直觉的现象：Block Size = 1024 的实测耗时（77.98 μs）优于 Block Size = 128（79.52 μs），但前者的理论 Occupancy 仅为 66.67%，后者高达 100%。
+**原理分析：**
 
-原理分析：
+- **1.**Occupancy 并非性能指标：Occupancy 是隐藏内存延迟的工具。对于纯访存受限（Memory-Bound）算子，一旦活跃 Warp 数量足以填满 LSU 和 DRAM 的请求队列（Saturation Point），额外的 Occupancy 只会增加队列拥塞，不会提升带宽。
 
-1.Occupancy 并非性能指标：Occupancy 是隐藏内存延迟的工具。对于纯访存受限（Memory-Bound）算子，一旦活跃 Warp 数量足以填满 LSU 和 DRAM 的请求队列（Saturation Point），额外的 Occupancy 只会增加队列拥塞，不会提升带宽。
+- **2.**摊薄 Block 调度开销：Block 128 会启动 6144 个 Block，而 Block 1024 仅启动 768 个。大 Block 显著减少了 GigaThread 调度开销、上下文切换和 Block 频繁退役带来的流水线气泡。
 
-2.摊薄 Block 调度开销：Block 128 会启动 6144 个 Block，而 Block 1024 仅启动 768 个。大 Block 显著减少了 GigaThread 调度开销、上下文切换和 Block 频繁退役带来的流水线气泡。
-
-结论：对于访存受限型算子（Memory-Bound），Occupancy 只是隐藏延迟的手段，而不是目的。只要活跃的 Warp 数量足够打满内存总线，再增加 Occupancy 就毫无意义，甚至适得其反。
+**结论：**对于访存受限型算子（Memory-Bound），Occupancy 只是隐藏延迟的手段，而不是目的。只要活跃的 Warp 数量足够打满内存总线，再增加 Occupancy 就毫无意义，甚至适得其反。
 
 
 ## 后续优化方向

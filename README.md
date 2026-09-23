@@ -54,6 +54,8 @@ __global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const 
 
 - **v1**：每线程仅处理 2 字节，全量数据需 8 倍访存指令，指令发射、warp 调度与地址译码的固定开销被放大，SM 发射槽利用率低，显存总线长期半空闲。
 - **v2**：每线程处理 16 字节，访存指令总数减少 8 倍，固定开销大幅摊薄，SM 指令发射效率显著提升，最终将显存带宽拉满至接近硬件上限。
+
+**发射槽利用率：**
 ![发射槽利用率](images/residual_ncu1.png)
 
 ### 2. 流式加载（`__ldcs`）

@@ -18,7 +18,7 @@ __global__ void residual_forward_kernel1(floatX* out, const floatX* inp1, const 
 ```
 
 ### 版本 2 — 128bit 向量化访存
-每个线程通过 128bit 向量指令（x128）一次处理 8 个 BF16 元素（16 字节），访存指令数减少 8 倍。
+每个线程通过 128bit 向量指令（x128）一次处理 8 个 BF16 元素（16 字节），访存指令数减少为原来的 1/8。
 ```cuda
 __global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const floatX* inp2, int N) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
@@ -53,10 +53,10 @@ __global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const 
 
 向量化的核心价值是提升指令发射端效率。
 
-- **v1**：每线程仅处理 2 字节，全量数据需 8 倍访存指令，指令发射、warp 调度与地址译码的固定开销被放大，SM 发射槽利用率低，显存总线长期半空闲。
-- **v2**：每线程处理 16 字节，访存指令总数减少 8 倍，固定开销大幅摊薄，SM 指令发射效率显著提升，最终将显存带宽拉满至接近硬件上限。
+- **版本1**：每线程仅处理 2 字节，全量数据需 8 倍访存指令，指令发射、warp 调度与地址译码的固定开销被放大，SM 发射槽利用率低，显存总线长期半空闲。
+- **版本2**：每线程处理 16 字节，访存指令总数减少 8 倍，固定开销大幅摊薄，SM 指令发射效率显著提升，最终将显存带宽拉满至接近硬件上限。
 
-**发射槽利用率：**
+**发射槽利用率截图：左边版本1，右边版本2**
 
 ![发射槽利用率](images/residual_ncu1.png)
 
@@ -86,7 +86,7 @@ __global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const 
 
 **2.** 摊薄 Block 调度开销：Block 128 会启动 6144 个 Block，而 Block 1024 仅启动 768 个。大 Block 显著减少了 GigaThread 调度开销、上下文切换和 Block 频繁退役带来的流水线气泡。
 
-**结论**：对于访存受限型算子（Memory-Bound），Occupancy 只是隐藏延迟的手段，而不是目的。只要活跃的 Warp 数量足够打满内存总线，再增加 Occupancy 就毫无意义，甚至适得其反。
+**结论**：对于访存受限型算子（Memory-Bound），Occupancy 只是隐藏延迟的手段，而不是目的。只要活跃的 Warp 数量足够打满内存总线，再增加 Occupancy 就毫无意义，甚至适得其反。这也是 CUDA 优化的原则：不盲目追求高 Occupancy，要先定位算子的真正瓶颈。
 
 
 ## 后续优化方向

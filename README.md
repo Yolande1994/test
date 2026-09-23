@@ -2,7 +2,7 @@
 
 Transformer 中的残差连接算子，实现两个张量的逐元素相加（out = inp1 + inp2）
 
-典型的**访存受限型算子（Memory-Bound）**（2读1写，计算量可忽略），核心优化目标是打满显存带宽（Memory Throughput）。
+典型的**访存受限型算子（Memory-Bound）**（2读1写，计算量可忽略），核心优化目标是打满**显存带宽（Memory Throughput）**。
 
 ## 版本迭代
 
@@ -56,6 +56,7 @@ __global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const 
 - **v2**：每线程处理 16 字节，访存指令总数减少 8 倍，固定开销大幅摊薄，SM 指令发射效率显著提升，最终将显存带宽拉满至接近硬件上限。
 
 **发射槽利用率：**
+
 ![发射槽利用率](images/residual_ncu1.png)
 
 ### 2. 流式加载（`__ldcs`）

@@ -46,6 +46,7 @@ __global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const 
 ### 全尺寸性能对比
 ![性能对比](images/residual_ncu.png)
 
+
 ## 优化原理
 
 ### 1. 128bit 向量化访存
@@ -71,6 +72,7 @@ __global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const 
 
 这种策略在保持访存带宽减半（BF16 优势）的同时，避免了低精度加法可能带来的累积误差，兼顾了性能与数值稳定性。
 
+
 ## 补充说明
 为什么 66% 的 Occupancy 能跑赢 100%？
 
@@ -84,7 +86,7 @@ __global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const 
 
 **2.** 摊薄 Block 调度开销：Block 128 会启动 6144 个 Block，而 Block 1024 仅启动 768 个。大 Block 显著减少了 GigaThread 调度开销、上下文切换和 Block 频繁退役带来的流水线气泡。
 
-**结论：**对于访存受限型算子（Memory-Bound），Occupancy 只是隐藏延迟的手段，而不是目的。只要活跃的 Warp 数量足够打满内存总线，再增加 Occupancy 就毫无意义，甚至适得其反。
+**结论**：对于访存受限型算子（Memory-Bound），Occupancy 只是隐藏延迟的手段，而不是目的。只要活跃的 Warp 数量足够打满内存总线，再增加 Occupancy 就毫无意义，甚至适得其反。
 
 
 ## 后续优化方向

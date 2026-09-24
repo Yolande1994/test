@@ -103,8 +103,8 @@ ADU（地址生成单元）、LSU（加载存储单元）利用率：29% → 6.6
 
 **算子融合**：当前残差连接需要独立占用 3 次访存（2读1写）。若后续算子为 LayerNorm / GEMM，可将其融合其中，直接在寄存器内完成加法，消除中间显存读写。
 
-
-
+<br>
+<br>
 
 ## 最后再展示一个负优化版本
 
@@ -153,11 +153,9 @@ __global__ void residual_forward_kernel3(floatX* out, const floatX* inp1, const 
 
 ![版本2与版本3性能截图](images/residual_ncu4.png)
 
-从总览表可见，版本3在几乎所有block size下性能均弱于版本2。
+从截图可见，版本3在几乎所有 block size 下性能均弱于版本2。以 block size 128 为例，两者理论 Occupancy 都是 100%：
 
-以 block size 128 为例，两者理论 Occupancy 都是 100% ：
-
-| 指标 | v2 | v3 | 变化 |
+| 指标 | 版本2 | 版本3 | 变化 |
 |------|:--:|:--:|------|
 | 耗时 | 80.90 us | 80.99 us | +0.11% |
 | 带宽利用率 | 93.96% | 92.78% | **-1.18%** |
@@ -165,7 +163,7 @@ __global__ void residual_forward_kernel3(floatX* out, const floatX* inp1, const 
 
 **原因分析：总线饱和后，指令并发只会造成拥堵**
 
-| 停滞原因 | v2 | v3 | 变化 |
+| 停滞原因 | 版本2 | 版本3 | 变化 |
 |----------|:--:|:--:|------|
 | Long Scoreboard（等访存返回） | 32.70% | 26.30% | ↓ 6.40% |
 | **Drain（流水线排空）** | 0.29% | **3.62%** | **↑ 3.33%** |
@@ -173,11 +171,11 @@ __global__ void residual_forward_kernel3(floatX* out, const floatX* inp1, const 
 | Short Scoreboard（等计算完成） | 0.36% | 2.16% | ↑ 1.80% |
 | MIO Throttle（内存IO限流） | — | 1.77% | 新增 |
 
-v3的 Long Scoreboard 降至26.30%，但 **Drain 从0.29%飙升至3.62%，LG Throttle 从0涨到2.28%**
+版本3的 Long Scoreboard 降至26.30%，但 **Drain 从0.29%飙升至3.62%，LG Throttle 从0涨到2.28%**
 
 这说明：DRAM总线已经饱和，再多的访存指令也塞不进去，反而在发射端堆积成拥堵——LSU队列满了之后开始限流，流水线频繁排空。
 **瓶颈不在"访存不够并行"，而在"总线已经满了，再加请求只会排队"。**
 
-次生因素：单线程寄存器从22 → 32个，SM可调度Warp数量减少，进一步削弱延迟隐藏能力。主要体现在block size = 32。
+**次生因素**：单线程寄存器从22 → 32个，SM可调度Warp数量减少，进一步削弱延迟隐藏能力。主要体现在block size = 32。
 
 **结论**：线程粗化对纯访存受限、带宽已触顶的算子**无收益甚至负向**。其更适合被使用在计算受限的算子上。

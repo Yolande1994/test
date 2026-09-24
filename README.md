@@ -5,6 +5,12 @@ Transformer 中标准的高斯误差线性单元激活函数，逐元素非线�
 典型的**访存为主、计算不可忽略的算子**（1读1写 + tanh 超越函数），
 核心优化目标是在保证数值精度的前提下尽量打满显存带宽。
 
+### tanh 近似版 GELU
+
+相比精确的 erf 版，采用 tanh 近似公式，在精度损失可忽略的前提下能大幅提升计算速度。
+
+$$ \text{GELU}(x) = 0.5x \cdot \left(1 + \tanh\left(\sqrt{\frac{2}{\pi}} \cdot (x + 0.044715x^3)\right)\right) $$
+
 ---
 
 ## 版本迭代
@@ -87,12 +93,6 @@ __global__ void gelu_forward_kernel2(floatX* out, const floatX* inp, int N) {
 ### 3. 混合精度计算（BF16 → FP32 → BF16）
 
 访存使用 BF16 减半带宽占用，计算提升为 FP32 保证数值精度，兼顾性能与数值稳定性。
-
-### 4. tanh 近似版 GELU
-
-采用 tanh 近似公式，相比精确的 erf 版，在精度损失可忽略的前提下大幅提升计算速度。
-
-$$ \text{GELU}(x) = 0.5x \cdot \left(1 + \tanh\left(\sqrt{\frac{2}{\pi}} \cdot (x + 0.044715x^3)\right)\right) $$
 
 <br>
 

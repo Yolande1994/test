@@ -1,191 +1,140 @@
-# Residual Forward — 残差连接
+# GELU Forward — GELU 激活函数
 
-Transformer 中的残差连接算子，实现两个张量的逐元素相加（out = inp1 + inp2）
+Transformer 中标准的高斯误差线性单元激活函数，逐元素非线性变换。
 
-典型的**访存受限型算子（Memory-Bound）**（2读1写，计算量可忽略），核心优化目标是打满**显存带宽（Memory Throughput）**。
+典型的**访存为主、计算不可忽略的算子**（1读1写 + tanh 超越函数），
+核心优化目标是在保证数值精度的前提下尽量打满显存带宽。
+
+---
 
 ## 版本迭代
 
 ### 版本 1 — 逐元素朴素并行
-每个线程处理 1 个 BF16 元素（2 字节）。访存指令数量多，发射调度开销大，显存总线请求不连续，带宽利用率不足。
+
+每个线程处理 1 个 BF16 元素（2 字节）。访存指令数量多，发射调度开销大，
+显存总线请求不连续，带宽利用率不足。
+
 ```cuda
-__global__ void residual_forward_kernel1(floatX* out, const floatX* inp1, const floatX* inp2, int N) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N) {
-        out[idx] = (floatX)((float)inp1[idx] + (float)inp2[idx]);
+__global__ void gelu_forward_kernel1(floatX* out, const floatX* inp, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {
+        float xi = inp[i];
+        float cube = 0.044715f * xi * xi * xi;
+        out[i] = 0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube)));
     }
 }
 ```
 
-### 版本 2 — 128bit 向量化访存
-每个线程通过 128bit 向量指令（x128）一次处理 8 个 BF16 元素（16 字节），访存指令数减少为原来的 1/8。
+### 版本 2 — 128bit 向量化访存 + 标量计算
+
+每个线程通过 128bit 向量指令一次加载/存储 8 个 BF16 元素（16 字节），
+访存指令数减少为原来的 1/8；计算部分仍逐个标量执行。
+
 ```cuda
-__global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const floatX* inp2, int N) {
-    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
-    if (idx < N) {
+__global__ void gelu_forward_kernel2(floatX* out, const floatX* inp, int N) {
+    int i = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
+    if (i < N) {
         x128 packed_out;
-        x128 packed_inp1 = load128cs(inp1 + idx); // 输入仅读取一次，流式加载
-        x128 packed_inp2 = load128cs(inp2 + idx);
-        for (int k = 0; k < packed_inp1.size; ++k) {
-            packed_out[k] = (floatX)((float)packed_inp1[k] + (float)packed_inp2[k]);  // 输入BF16→计算FP32→输出BF16，避免低精度累加损失
+        x128 packed_inp = load128cs(inp + i); // 输入只读一次，流式加载
+        for (int k = 0; k < packed_inp.size; ++k) {
+            float xi = (float)packed_inp[k];
+            float cube = 0.044715f * xi * xi * xi;
+            packed_out[k] = (floatX)(0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube))));
         }
-        store128(out + idx, packed_out); // 输出保留在缓存，供后续算子复用
+        store128(out + i, packed_out); // 输出保留缓存，供下一层复用
     }
 }
 ```
 
-| 指标 | 版本1 朴素版 | 版本2 向量化 |
+| 指标 | 版本1 朴素版 | 版本2 向量化版 |
 | :--- | :--- | :--- |
-| Kernel耗时 | 136.26 μs | 77.98 μs |
-| DRAM带宽利用率 | 57.75% | 95.15% |
-| 单线程寄存器 | 16 | 22 |
-| 最优Block Size | 128 | 1024 |
+| Kernel耗时 | 基准值 | 提升约 1.6~1.7 倍 |
+| DRAM带宽利用率 | ~57% | ~90% |
+| 计算吞吐量 | ~30% | ~73% |
+| 最优Block Size | 128 | 128 |
 
-**整体性能提升 1.75 倍**，带宽利用率从 58% 提升至 95%，接近显存带宽理论峰值。
+**带宽利用率从 57% 提升至 90%**，接近访存主导型算子的合理上限。
+计算侧因包含 tanh 超越函数，仍存在优化空间。
 
 ### 全尺寸性能对比
-![性能对比](images/residual_ncu.png)
+
+![性能对比](images/gelu_ncu.png)
 
 <br>
 
 ## 优化原理
 
-### 1. 128bit 向量化访存
+### 1. 访存向量化，计算标量化
 
-向量化的核心价值是提升指令发射端效率。
+这是 GELU 与纯访存算子的区别：
 
-- **版本1**：每线程仅处理 2 字节，同样的总数据需 8 倍访存指令，指令发射、warp 调度与地址译码的固定开销被放大，SM 发射槽利用率低，显存总线长期半空闲。
-- **版本2**：每线程处理 16 字节，访存指令总数减少 8 倍，固定开销大幅摊薄，SM 指令发射效率显著提升，最终将显存带宽拉满至接近硬件上限。
+- **访存部分向量化**：128bit 向量指令一次读写 16 字节，访存指令数减少 8 倍，
+  摊薄指令发射与调度开销，最大化显存总线利用率。
+- **计算部分标量化**：GELU 包含 `tanh` 超越函数，硬件没有对应的 128bit 向量计算指令，
+  强行用向量计算反而会因指令拆分、调度低效而降速。计算部分仍逐个标量执行。
 
-**物理流水线利用率对比：左边版本1，右边版本2**
+> 逐元素算子的通用优化原则：能向量化的部分尽量向量化，无对应硬件指令的部分不强行硬做。
 
->ADU（地址生成单元）、LSU（加载存储单元）利用率：29% → 6.6%，下降约 77%。说明用更少的指令完成了访存。
+### 2. 缓存策略
 
-![流水线利用率截图](images/residual_ncu3.png)
+结合算子上下游场景选择缓存指令：
 
-**发射槽利用率截图：左边版本1，右边版本2**
-
->发射槽理论加速空间：42.25% → 4.85%，指令发射节奏接近硬件峰值。
-
-![发射槽利用率](images/residual_ncu1.png)
-
-### 2. 流式加载（`__ldcs`）
-
-残差连接的输入数据（inp1 和 inp2）在计算完成后便不再被本算子复用。若使用默认加载策略，这些一次性数据会占用宝贵的 L1/L2 缓存空间。 
-
-这里使用了 load128cs（Cache Streaming）。该指令会将加载的数据标记为 "evict-first"（优先驱逐），在数据被消费后迅速腾出缓存空间。避免对 L1 缓存造成污染，为后续操作留出了缓存余量。
+- **读：`load128cs` 流式加载**：输入数据仅读取一次，用完即弃，
+  不在 L1 长期驻留，避免缓存污染，为后续层留出缓存余量。
+- **写：`store128` 普通存储**：GELU 输出是下一层算子的输入，很快会被再次读取，
+  保留在缓存中可提升后续算子的缓存命中率。
 
 ### 3. 混合精度计算（BF16 → FP32 → BF16）
 
-在计算过程中将 BF16 张量提升为 FP32 进行加法运算，然后再转换回 BF16 输出。 
+访存使用 BF16 减半带宽占用，计算提升为 FP32 保证数值精度，兼顾性能与数值稳定性。
 
-这在保持访存带宽减半（BF16 优势）的同时，避免了低精度加法可能带来的累积误差，兼顾性能与数值稳定性。
+### 4. tanh 近似版 GELU
+
+采用 tanh 近似公式，相比精确的 erf 版，在精度损失可忽略的前提下大幅提升计算速度。
+
+$$ \text{GELU}(x) = 0.5x \cdot \left(1 + \tanh\left(\sqrt{\frac{2}{\pi}} \cdot (x + 0.044715x^3)\right)\right) $$
 
 <br>
 
 ## 补充说明
-为什么 66% 的 Occupancy 能跑赢 100%？
 
-在版本2的调优中，有个反直觉现象：Block Size = 1024 的实测耗时（77.98 μs）略优于 Block Size = 128（79.52 μs），但前者的理论 Occupancy 仅为 66.67%，后者高达 100%。
+为什么带宽只有 90%，而残差算子能跑到 95%？
 
-![版本2 Occupancy 对比](images/residual_ncu2.png)
+GELU 整体仍是访存受限型，但**计算密度显著高于纯访存算子**，
+这直接导致了带宽利用率的差距：
 
-**原理分析：**
+| 指标 | 残差算子 | GELU 算子 |
+|------|:--------:|:---------:|
+| 计算吞吐量 | ~30% | ~73% |
+| 显存带宽利用率 | ~95% | ~90% |
+| 每元素计算量 | 1 次加法 | 三次方 + tanh + 多次乘加 |
 
-**1.** Occupancy 并非性能指标：Occupancy 是隐藏内存延迟的工具。对于纯访存受限算子，一旦活跃 Warp 数量足以填满 LSU 和 DRAM 的请求队列，额外的 Occupancy 只会增加队列拥塞，不会提升带宽。
+**原理：**
+显存带宽跑满的前提是 SM 持续有足够多的就绪 Warp 向 LSU 提交访存请求。
+GELU 包含 tanh 超越函数（走 SFU 特殊功能单元），计算延迟远高于普通加法。
+Warp 大量时间停在计算态，访存请求是间断性的，总线出现空闲窗口，
+平均利用率自然比纯访存的残差算子低。
 
-**2.** 摊薄调度开销：Block 128 会启动 6144 个 Block，而 Block 1024 仅启动 768 个。大 Block 降低了 GigaThread 调度开销、上下文切换和小 Block 频繁调度产生的流水线气泡。
+---
 
-**结论**：对于访存受限型算子，Occupancy 只是隐藏延迟的手段，而不是目的。只要活跃的 Warp 数量足够打满内存总线，再增加 Occupancy 就毫无意义，甚至适得其反。所以 CUDA 的优化原则之一：不盲目追求高 Occupancy，要先定位算子的真正瓶颈。
+为什么最优 Block Size 是 128，而不是 1024？
+
+残差算子的最优 Block Size 是 1024（大 Block 摊薄调度开销），
+但 GELU 的最优 Block Size 是 128。原因：
+
+- **残差是纯访存算子**：计算量可忽略，只要活跃 Warp 数量够打满显存总线就行，
+  66% Occupancy 足够，大 Block 更优。
+- **GELU 有不可忽略的计算量**：tanh 计算延迟长，需要更高的 Occupancy
+  来提供更多并行 Warp，用数量弥补单个 Warp 计算慢的问题，隐藏计算流水线延迟。
+
+Block=128 时理论 Occupancy 接近 100%，足够同时隐藏访存延迟和计算延迟；
+Block=1024 时 Occupancy 仅 66%，计算流水线喂不饱，性能反而下降。
+
+> **经验规律**：算子计算密度越高，最优 Block Size 越小，对 Occupancy 的需求越高。
 
 <br>
 
 ## 后续优化方向
 
-单算子层面已接近显存带宽物理上限（受限于 DRAM 刷新、读写方向切换损耗和 ECC 硬件开销等，剩余空间不足 5%），更高收益的优化方向为：
-
-**算子融合**：当前残差连接需要独立占用 3 次访存（2读1写）。后续算子为 LayerNorm / GEMM 时，可将其融合其中，直接在寄存器内完成加法，消除中间显存读写。
-
-<br>
-<br>
-<br>
-
-## 最后再展示一个负优化版本
-
-### 版本 3 — 线程粗化版（每线程 2个x128 包）
-
-尝试每个线程处理 2 个连续数据包，并行发起 4 路独立访存，
-
-期望通过更高的指令级并行（ILP）进一步喂饱显存总线。
-
-```cuda
-__device__ __forceinline__ x128 residual_compute(x128 a, x128 b) {
-    x128 out;
-    for (int k = 0; k < a.size; ++k) {
-        out[k] = (floatX)((float)a[k] + (float)b[k]);
-    }
-    return out;
-}
-
-__global__ void residual_forward_kernel3(floatX* out, const floatX* inp1, const floatX* inp2, int N) {
-    // 每个线程处理 2 个 x128 包
-    int i1 = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size * 2;
-    int i2 = i1 + x128::size;
-
-    if (i2 < N) { // 双包完整
-        // 并行发起 4 路独立访存，提升内存级并行 (MLP)
-        x128 inp1_pack1 = load128cs(inp1 + i1);
-        x128 inp1_pack2 = load128cs(inp1 + i2);
-        x128 inp2_pack1 = load128cs(inp2 + i1);
-        x128 inp2_pack2 = load128cs(inp2 + i2);
-
-        x128 out1 = residual_compute(inp1_pack1, inp2_pack1);
-        x128 out2 = residual_compute(inp1_pack2, inp2_pack2);
-
-        store128(out + i1, out1);
-        store128(out + i2, out2);
-    } else if (i1 < N) { // 尾部单包
-        x128 inp1_tail = load128cs(inp1 + i1);
-        x128 inp2_tail = load128cs(inp2 + i1);
-        x128 out_tail = residual_compute(inp1_tail, inp2_tail);
-        store128(out + i1, out_tail);
-    }
-}
-```
-
-**版本2与版本3性能对比，结果：全面负优化**
-
-![版本2与版本3性能截图](images/residual_ncu4.png)
-
-从截图可见，版本3在几乎所有 block size 下性能均弱于版本2。以 block size 128 为例，两者理论 Occupancy 都是 100%：
-
-| block size 128 | 版本2 | 版本3 | 变化 |
-|------|:--:|:--:|------|
-| 耗时 | 80.90 us | 80.99 us | +0.11% |
-| 带宽利用率 | 93.96% | 92.78% | **-1.18%** |
-| 单线程寄存器 | 22 | 32 | +45% |
-
-**原因分析：总线饱和后，指令并发只会造成拥堵**
-
-| 停滞原因 | 版本2 | 版本3 | 变化 |
-|----------|:--:|:--:|------|
-| Long Scoreboard（等访存返回） | 32.70% | 26.30% | ↓ 6.40% |
-| Drain（流水线排空） | 0.29% | 3.62% | ↑ 3.33% |
-| LG Throttle（LSU限流） | 0.00% | 2.28% | ↑ 2.28% |
-| Short Scoreboard（等计算完成） | 0.36% | 2.16% | ↑ 1.80% |
-| MIO Throttle（内存IO限流） | — | 1.77% | 新增 |
-
-**Long Scoreboard 降至26.30%，但 Drain 从0.29%升至3.62%，LG Throttle 从0涨到2.28%**
-
->**Stall Drain（流水线排空）**：单线程写了2个包，Warp 执行完指令准备退休时，硬件必须等待该 Warp 发出的所有 Store 写请求确认到达 L2/DRAM 后，才能释放寄存器资源。总线饱和时写请求积压，老 Warp 无法及时退出，新 Warp 无法补位，流水线频繁空转排空。
-
->**LG Throttle / MIO Throttle**：LSU 指令队列和内存 IO 通道达到满载上限，对新发起的访存指令执行限流，是总线吞吐量触顶的直接表现。
-
-版本3 Long Scoreboard 虽有降低，但当 DRAM 总线已饱和时，再盲目增加 ILP 只是往狭窄的管道里瞬间猛灌请求，积压导致 LG Throttle (LSU 队列限流) 和 MIO Throttle (内存IO限流) 增长，产生排空停顿（Drain）。这说明**瓶颈不在"访存不够并行"，而是"总线已满，再加请求只会排队"。**
-
-**次生因素**：单线程寄存器从22 → 32个，SM可调度Warp数量减少，虽然这里大部分 block size 尺寸下的理论 Occupancy 都是 100%，但寄存器开销上升可能导致硬件调度的灵活性受损，放大拥堵效应。
-
-
-<br>
-
-**结论**：线程粗化对纯访存受限、带宽已触顶的算子**无收益甚至负向**。其更适合被使用在计算受限的算子上。
+和残差连接一样，进行**算子融合**：将 GELU 与上游线性层 / 残差加法融合为一个 Kernel，
+直接消除中间张量的全局显存读写，在寄存器内完成计算，是 Transformer 推理的标准优化。

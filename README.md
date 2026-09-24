@@ -175,13 +175,13 @@ __global__ void residual_forward_kernel3(floatX* out, const floatX* inp1, const 
 | Short Scoreboard（等计算完成） | 0.36% | 2.16% | ↑ 1.80% |
 | MIO Throttle（内存IO限流） | — | 1.77% | 新增 |
 
-版本3的 Long Scoreboard 降至26.30%，但 **Drain 从0.29%升至3.62%，LG Throttle 从0涨到2.28%**
+**Long Scoreboard 降至26.30%，但 Drain 从0.29%升至3.62%，LG Throttle 从0涨到2.28%**
 
 - **Stall Drain（流水线排空）**：单线程写了2个包，Warp 执行完指令准备退休时，硬件必须等待该 Warp 发出的所有 Store 写请求确认到达 L2/DRAM 后，才能释放寄存器资源。总线饱和时写请求积压，老 Warp 无法及时退出，新 Warp 无法补位，流水线频繁空转排空。
 
 - **LG Throttle / MIO Throttle**：LSU 指令队列和内存 IO 通道达到满载上限，对新发起的访存指令执行限流，是总线吞吐量触顶的直接表现。
 
-Long Scoreboard 虽然从 32.70 降到了 26.30，但当 DRAM 总线已饱和时，再盲目增加 ILP 只是往狭窄的管道里瞬间猛灌请求，积压导致 LG Throttle (LSU 队列限流) 和 MIO Throttle (内存IO限流) 增长，产生排空停顿（Drain）。这说明**瓶颈不在"访存不够并行"，而是"总线已满，再加请求只会排队"。**
+版本3 Long Scoreboard 虽有降低，但当 DRAM 总线已饱和时，再盲目增加 ILP 只是往狭窄的管道里瞬间猛灌请求，积压导致 LG Throttle (LSU 队列限流) 和 MIO Throttle (内存IO限流) 增长，产生排空停顿（Drain）。这说明**瓶颈不在"访存不够并行"，而是"总线已满，再加请求只会排队"。**
 
 **次生因素**：单线程寄存器从22 → 32个，SM可调度Warp数量减少，虽然这里大部分 block size 尺寸下的理论 Occupancy 都是 100%，但寄存器开销上升可能导致硬件调度的灵活性受损，放大拥堵效应。
 

@@ -39,9 +39,7 @@ y = (x - E[x]) / sqrt(Var(x) + eps) * weight + bias
 
 ## v1 — 朴素移植：CPU 逻辑直接搬上 GPU
 
-### 思路
-
-最直观的写法：把 CPU 三层循环的最内层（每个 Token）映射到一个 GPU 线程，通道维度 C 仍然串行遍历。
+最直观的写法：在 B、T 维度并行，一个 GPU 线程负责一个 token，通道维度 C 仍然串行遍历。
 
 ```cuda
 __global__ void layernorm_forward_kernel1(
@@ -83,15 +81,13 @@ __global__ void layernorm_forward_kernel1(
 
 ---
 
-## v2 — 三 Kernel 拆分：并行度从哪来？
+## v2 — 三 Kernel 拆分
 
-### 思路
-
-v1 的问题是通道维度 C 完全串行。v2 把 C 维度也并行化，拆成三个独立 Kernel：
+v1 的问题是通道维度 C 完全串行。v2 把 C 维度也并行化，将 LayerNorm 的均值计算、方差计算、归一化操作分别拆分为三个独立的 Kernel。：
 
 1. **`mean_kernel`**：1 个 Block 处理 1 行，Block 内多线程分摊 C 个元素，用**共享内存二分规约**求均值。
 2. **`rstd_kernel`**：同理求方差倒数。
-3. **`normalization_kernel`**：彻底展开成全并行——每个线程处理 1 个输出元素，直接查表。
+3. **`normalization_kernel`**：展开成并行——每个线程处理 1 个输出元素。
 
 ```cuda
 // mean_kernel 核心：Block 级共享内存二分规约
@@ -115,12 +111,12 @@ __global__ void mean_kernel(float* mean, const float* inp, int N, int C, int blo
 }
 ```
 
-### 进步与代价
+### 进步与问题
 
-**进步**：C 维度并行起来了，耗时从 1.00ms 降到 0.34ms（3 倍提升）。
+**进步**：C 维度并行起来了，耗时从 1.00ms 降到 0.34ms。
 
-**代价**：
-1. **三个 Kernel 串行启动**，有 launch overhead。
+**问题**：
+1. **三个 Kernel 串行启动**，有多次启动开销。
 2. **中间结果 mean/rstd 写回全局内存**，下一个 Kernel 再读回来——多了两次不必要的全局访存。
 3. Block 级规约需要**共享内存 + `__syncthreads()`**，跨 Warp 通信开销大。
 
@@ -130,9 +126,7 @@ __global__ void mean_kernel(float* mean, const float* inp, int N, int C, int blo
 
 ## v3 — Warp 级两趟法：去掉共享内存和中间写回
 
-### 思路
-
-v2 的核心痛点是"跨 Warp 通信必须走共享内存"。那如果**一个 Warp（32 线程）就能独立处理一整行**呢？
+v2 的核心痛点是"跨 Warp 通信必须走共享内存"。那如果**一个 Warp（32 线程）独立处理一整行**呢？
 
 - **任务划分**：1 个 Warp = 1 个 Token，32 个线程分摊 C=768 个元素。
 - **规约方式**：Warp 内 32 线程通信走**硬件 shuffle 指令**（`__shfl_down_sync`），直接互读寄存器，不需要共享内存，不需要 `__syncthreads()`。
@@ -191,8 +185,6 @@ Warp 级规约的延迟只有几个时钟周期（shuffle 是硬件指令），�
 ---
 
 ## v4 — 单趟法：理论上更快，实际呢？
-
-### 思路
 
 v3 读了 input 两次（第一趟算均值，第二趟算方差）。数学上有个公式：
 

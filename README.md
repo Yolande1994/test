@@ -352,26 +352,11 @@ v5 (0.15ms)  Block 级两级规约，C=768 时反而慢
 v6 (0.11ms)  128bit 访存 + 共享内存复用，打满带宽
 ```
 
-### 核心规律
+### 规律总结
 
 1. **规约计算的层级越低越快**：Warp shuffle（寄存器）> Block 共享内存 > 全局内存。
 2. **能在单 Kernel 里做完就别拆**：中间结果写回再读回的代价，往往大于并行化的收益。
 3. **访存受限算子的终极优化是减少 DRAM 访问次数**：v6 把 input 从读 2 次 DRAM 变成读 1 次，weight/bias 从每个 Warp 读一次变成全 Block 读一次。
-4. **实测数据比理论分析重要**：v4 理论上少一趟访存应该更快，但 L2 缓存让收益消失了——benchmark 才是真理。
+4. **实测数据比理论分析重要**：v4 理论上少一趟访存应该更快，但实测没有超过v3——benchmark 才是真理。
 
 ---
-
-## 编译与运行
-
-```bash
-# 编译
-nvcc -O3 --use_fast_math layernorm_forward.cu -o layernorm_forward
-
-# 运行指定版本（自动验证正确性 + benchmark）
-./layernorm_forward 1   # v1
-./layernorm_forward 3   # v3
-
-# NCU 性能剖析（需先编译带 -lineinfo）
-nvcc -O3 -lineinfo --use_fast_math layernorm_forward.cu -o layernorm_forward
-ncu --set full --launch-skip 16 --launch-count 8 -o layernorm_profile ./layernorm_forward 0 profile
-```

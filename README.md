@@ -2,8 +2,6 @@
 
 从 CPU 朴素移植到工业级向量化实现，完整记录 LayerNorm 前向传播算子在 GPU 上的 6 个版本迭代过程。
 
-> 测试环境：RTX 5060 Laptop | CUDA 12.x | FP32 | B=8, T=1024, C=768（GPT-2 small 配置）
-
 ---
 
 ## 算子简介
@@ -11,7 +9,7 @@
 LayerNorm 对每个 Token 的特征通道做归一化：
 
 ```
-y = (x - E[x]) / sqrt(Var(x) + eps) * gamma + beta
+y = (x - E[x]) / sqrt(Var(x) + eps) * weight + bias
 ```
 
 这是一个**访存受限型算子（Memory-Bound）**：
@@ -35,7 +33,7 @@ y = (x - E[x]) / sqrt(Var(x) + eps) * gamma + beta
 
 > v2 耗时为三个 Kernel 之和：mean 0.08 + rstd 0.09 + norm 0.17 = 0.34 ms。
 
-**从 v1 到 v6，性能提升约 9 倍。** 下方逐版本拆解优化心路。
+**从 v1 到 v6，性能提升约 9 倍。** 下方逐版本拆解优化历程。
 
 ---
 

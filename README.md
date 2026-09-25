@@ -1,133 +1,390 @@
-# GELU Forward — GELU 激活函数
+# LayerNorm Forward — CUDA 算子优化实战
 
-Transformer 中标准的高斯误差线性单元激活函数，逐元素非线性变换。
+从 CPU 朴素移植到工业级向量化实现，完整记录 LayerNorm 前向传播算子在 GPU 上的 6 个版本迭代过程。
 
-典型的**访存为主、计算不可忽略的算子**（1读1写 + tanh 超越函数），
-核心优化目标是在保证数值精度的前提下尽量打满显存带宽。
-
-### tanh 近似版 GELU
-
-相比精确的 erf 版，采用 tanh 近似公式，在精度损失可忽略的前提下能大幅提升计算速度。
-
-$$ \text{GELU}(x) = 0.5x \cdot \left(1 + \tanh\left(\sqrt{\frac{2}{\pi}} \cdot (x + 0.044715x^3)\right)\right) $$
+> 测试环境：RTX 5060 Laptop | CUDA 12.x | FP32 | B=8, T=1024, C=768（GPT-2 small 配置）
 
 ---
 
-## 版本迭代
+## 算子简介
 
-### 版本 1 — 逐元素朴素并行
+LayerNorm 对每个 Token 的特征通道做归一化：
 
-每个线程处理 1 个 BF16 元素（2 字节）。访存指令数量多，发射调度开销大，
-显存总线请求不连续，带宽利用率不足。
+```
+y = (x - E[x]) / sqrt(Var(x) + eps) * gamma + beta
+```
+
+这是一个**访存受限型算子（Memory-Bound）**：
+
+- **计算量**：均值规约 + 方差规约 + 逐元素归一化 + 缩放平移
+- **访存量**：读 input + 读 weight/bias + 写 output
+- **优化核心**：在规约计算和访存效率之间找平衡，尽可能打满显存带宽
+
+---
+
+## 性能总览
+
+| 版本 | 核心实现 | 耗时 (ms) | Compute (%) | Memory (%) | 寄存器 |
+|:---:|---|:---:|:---:|:---:|:---:|
+| v1 | CPU 朴素移植，1 线程处理 1 行 | 1.00 | 5.83 | 63.58 | 40 |
+| v2 | 三 Kernel 拆分，Block 级共享内存规约 | 0.34 | — | — | — |
+| v3 | Warp 级两趟法，shuffle 规约 | 0.12 | 57.09 | 74.53 | 26 |
+| v4 | Warp 级单趟法，E[x²]−E[x]² | 0.12 | 47.26 | 75.74 | 24 |
+| v5 | Block 级两级规约，适配大 C | 0.15 | 62.98 | 69.05 | 22 |
+| v6 | 共享内存 + 128bit 向量化 | **0.11** | 26.08 | **83.39** | 42 |
+
+> v2 耗时为三个 Kernel 之和：mean 0.08 + rstd 0.09 + norm 0.17 = 0.34 ms。
+
+**从 v1 到 v6，性能提升约 9 倍。** 下方逐版本拆解优化心路。
+
+---
+
+## v1 — 朴素移植：CPU 逻辑直接搬上 GPU
+
+### 思路
+
+最直观的写法：把 CPU 三层循环的最内层（每个 Token）映射到一个 GPU 线程，通道维度 C 仍然串行遍历。
 
 ```cuda
-__global__ void gelu_forward_kernel1(floatX* out, const floatX* inp, int N) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < N) {
-        float xi = inp[i];
-        float cube = 0.044715f * xi * xi * xi;
-        out[i] = 0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube)));
+__global__ void layernorm_forward_kernel1(
+    float* out, float* mean, float* rstd,
+    const float* inp, const float* weight, const float* bias, int N, int C) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+
+    const float* x = inp + idx * C;
+
+    // 三趟串行循环：均值 → 方差 → 归一化
+    float m = 0.0f;
+    for (int i = 0; i < C; i++) m += x[i];
+    m /= C;
+
+    float v = 0.0f;
+    for (int i = 0; i < C; i++) {
+        float d = x[i] - m;
+        v += d * d;
+    }
+    v /= C;
+    float s = rsqrtf(v + 1e-5f);
+
+    float* o = out + idx * C;
+    for (int i = 0; i < C; i++) {
+        o[i] = s * (x[i] - m) * weight[i] + bias[i];
+    }
+    mean[idx] = m;
+    rstd[idx] = s;
+}
+```
+
+### 问题
+
+- **一个线程串行跑 C=768 次循环**，GPU 上有几千个 CUDA Core，但每个线程是串行的，算力严重浪费。
+- **读 input 三次**（均值、方差、归一化各一趟），访存效率低。
+- Compute Throughput 只有 5.83%——几乎没用到算力，纯粹被串行循环卡住了。
+
+---
+
+## v2 — 三 Kernel 拆分：并行度从哪来？
+
+### 思路
+
+v1 的问题是通道维度 C 完全串行。v2 把 C 维度也并行化，拆成三个独立 Kernel：
+
+1. **`mean_kernel`**：1 个 Block 处理 1 行，Block 内多线程分摊 C 个元素，用**共享内存二分规约**求均值。
+2. **`rstd_kernel`**：同理求方差倒数。
+3. **`normalization_kernel`**：彻底展开成全并行——每个线程处理 1 个输出元素，直接查表。
+
+```cuda
+// mean_kernel 核心：Block 级共享内存二分规约
+__global__ void mean_kernel(float* mean, const float* inp, int N, int C, int block_size) {
+    extern __shared__ float shared[];
+    int idx = blockIdx.x;
+    int tid = threadIdx.x;
+    const float* x = inp + idx * C;
+
+    float sum = 0.0f;
+    for (int i = tid; i < C; i += block_size) sum += x[i];
+    shared[tid] = sum;
+    __syncthreads();
+
+    // 二分规约：步长折半，每轮同步
+    for (int stride = block_size / 2; stride >= 1; stride /= 2) {
+        __syncthreads();
+        if (tid < stride) shared[tid] += shared[tid + stride];
+    }
+    if (tid == 0) mean[idx] = shared[0] / C;
+}
+```
+
+### 进步与代价
+
+**进步**：C 维度并行起来了，耗时从 1.00ms 降到 0.34ms（3 倍提升）。
+
+**代价**：
+1. **三个 Kernel 串行启动**，有 launch overhead。
+2. **中间结果 mean/rstd 写回全局内存**，下一个 Kernel 再读回来——多了两次不必要的全局访存。
+3. Block 级规约需要**共享内存 + `__syncthreads()`**，跨 Warp 通信开销大。
+
+> 观察 mean_kernel 和 rstd_kernel 的 Memory Throughput 都达到了 ~84%，说明纯访存操作本身已经很高效。瓶颈不在带宽，而在**Kernel 拆分带来的额外全局读写和同步**。
+
+---
+
+## v3 — Warp 级两趟法：去掉共享内存和中间写回
+
+### 思路
+
+v2 的核心痛点是"跨 Warp 通信必须走共享内存"。那如果**一个 Warp（32 线程）就能独立处理一整行**呢？
+
+- **任务划分**：1 个 Warp = 1 个 Token，32 个线程分摊 C=768 个元素。
+- **规约方式**：Warp 内 32 线程通信走**硬件 shuffle 指令**（`__shfl_down_sync`），直接互读寄存器，不需要共享内存，不需要 `__syncthreads()`。
+- **单 Kernel 完成全部计算**：均值、方差、归一化在同一个 Kernel 里完成，中间结果留在寄存器，不写回全局内存。
+- **流式访存**：输入读一次就不再用，用 `__ldcs` 绕过缓存，给 weight/bias 留出 L2 空间。
+
+```cuda
+__global__ void layernorm_forward_kernel3(
+    float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
+    const float* __restrict__ inp, const float* __restrict__ weight,
+    const float* __restrict__ bias, int N, int C) {
+
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+
+    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    if (idx >= N) return;
+    const float* x = inp + idx * C;
+
+    // ── 第一趟：算均值 ──
+    float sum = 0.0f;
+    for (int i = warp.thread_rank(); i < C; i += warp.size()) sum += x[i];
+    sum = cg::reduce(warp, sum, cg::plus<float>{});  // shuffle 规约，无共享内存
+    float m = sum / C;
+
+    // ── 第二趟：算方差（两趟法，数值稳定）──
+    sum = 0.0f;
+    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
+        float d = x[i] - m;
+        sum += d * d;
+    }
+    sum = cg::reduce(warp, sum, cg::plus<float>{});
+    float s = rsqrtf(sum / C + 1e-5f);  // 硬件原生指令
+
+    // ── 第三趟：归一化 + 仿射变换 ──
+    float* o = out + idx * C;
+    for (int c = warp.thread_rank(); c < C; c += warp.size()) {
+        float n = s * (__ldcs(x + c) - m);
+        __stcs(o + c, n * weight[c] + bias[c]);
     }
 }
 ```
 
-### 版本 2 — 128bit 向量化访存 + 标量计算
+### 为什么快？
 
-每个线程通过 128bit 向量指令一次加载/存储 8 个 BF16 元素（16 字节），
-访存指令数减少为原来的 1/8；计算部分仍逐个标量执行。
+| 对比项 | v2 (Block 级) | v3 (Warp 级) |
+|---|---|---|
+| 规约通信 | 共享内存读写 + `__syncthreads()` | shuffle 指令，寄存器直读 |
+| 中间结果 | mean/rstd 写回 DRAM 再读回 | 留在寄存器，零全局访存 |
+| Kernel 数量 | 3 个 | 1 个 |
+| 耗时 | 0.34 ms | **0.12 ms** |
+
+Warp 级规约的延迟只有几个时钟周期（shuffle 是硬件指令），而 Block 级共享内存规约需要多次 `__syncthreads()`，延迟高一个数量级。
+
+---
+
+## v4 — 单趟法：理论上更快，实际呢？
+
+### 思路
+
+v3 读了 input 两次（第一趟算均值，第二趟算方差）。数学上有个公式：
+
+```
+Var(x) = E[x²] - E[x]²
+```
+
+这样一次遍历就能同时累加 `sum(x)` 和 `sum(x²)`，省掉第二趟读 input。
 
 ```cuda
-__global__ void gelu_forward_kernel2(floatX* out, const floatX* inp, int N) {
-    int i = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
-    if (i < N) {
-        x128 packed_out;
-        x128 packed_inp = load128cs(inp + i); // 输入只读一次，流式加载
-        for (int k = 0; k < packed_inp.size; ++k) {
-            float xi = (float)packed_inp[k];
-            float cube = 0.044715f * xi * xi * xi;
-            packed_out[k] = (floatX)(0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube))));
-        }
-        store128(out + i, packed_out); // 输出保留缓存，供下一层复用
+// v4 核心：一次循环同时累加 sum 和 sum2
+float sum = 0.0f, sum2 = 0.0f;
+for (int i = warp.thread_rank(); i < C; i += warp.size()) {
+    float xi = x[i];
+    sum += xi;
+    sum2 += xi * xi;
+}
+sum  = cg::reduce(warp, sum, cg::plus<float>{});
+sum2 = cg::reduce(warp, sum2, cg::plus<float>{});
+float m = sum / C;
+float var = sum2 / C - m * m;  // 套公式
+float s = rsqrtf(var + 1e-5f);
+```
+
+### 实测：和 v3 一样快（0.12ms），为什么？
+
+理论上少读一次 input 应该更快，但数据打平了。三个原因：
+
+1. **L2 缓存吃掉了收益**：v3 第二趟读 input 时，数据还在 L2 里（整个 input 约 25MB，RTX 5060 的 L2 缓存足够大），根本没去读 DRAM。v4 省下的那次 L2 读取，收益微乎其微。
+2. **计算依赖链变长**：同时累加 sum 和 sum2，指令并行度下降，Compute Throughput 从 57.09% 降到 47.26%。
+3. **数值稳定性代价**：当输入数值大但方差小时（比如所有值都是 10000.1），`E[x²]` 和 `E[x]²` 都是上亿的大数，两个大数相减会丢精度，甚至算出负方差导致 NaN。
+
+> **工程选型**：训练用 v3（两趟法，数值稳）；推理可以用 v4（精度损失不敏感，少一趟访存）。
+
+---
+
+## v5 — Block 级两级规约：解决大通道数问题
+
+### 思路
+
+v3 的局限：1 个 Warp 只有 32 个线程，当 C 很大时（如 C=4096），每个线程要循环 128 次，并行度不够。
+
+v5 回到 Block 级：1 个 Block 处理 1 行，用更多线程分摊。但又不能像 v2 那样纯走共享内存——所以搞了个**两级规约**：
+
+```
+每个线程先算局部 sum
+    → Warp 内 shuffle 规约（32 线程一组，走寄存器）
+    → 各 Warp 的结果写入共享内存（只写 num_warps 个 float）
+    → 每个 Warp 从共享内存读回所有 Warp 的结果
+    → 再做一次 Warp 内 shuffle 规约
+    → 得到整个 Block 的总和
+```
+
+```cuda
+// 第一级：Warp 内 shuffle 规约
+float warp_sum = cg::reduce(warp, thread_sum, cg::plus<float>{});
+
+// 跨 Warp：只写一次共享内存
+shared_sum[warp_id] = warp_sum;
+__syncthreads();
+
+// 第二级：从共享内存读回，再做一次 Warp 规约
+warp_sum = (lane_id < num_warps) ? shared_sum[lane_id] : 0.0f;
+float block_sum = cg::reduce(warp, warp_sum, cg::plus<float>{});
+```
+
+### 为什么 C=768 时 v5 反而比 v3 慢？（0.15 vs 0.12）
+
+v5 在 C=768 时不是最优，原因：
+
+1. **多了 `__syncthreads()` 同步**：Warp 之间要等齐。
+2. **C=768 不大**：32 个线程每个循环 24 次，已经足够并行，Block 级的优势体现不出来。
+3. **v5 用的是单趟法**（和 v4 一样 `E[x²]-E[x]²`），计算依赖链更长，Compute Throughput 虽高但实际延迟没优势。
+
+> **结论**：C ≤ 1024 时 Warp 级（v3）更优；C ≥ 4096 时 Block 级两级规约（v5）更能打满算力。
+
+---
+
+## v6 — 工业级：共享内存 + 128bit 向量化
+
+### 思路
+
+v3 已经很快了，但还有两个浪费：
+1. input 读了两次（均值一趟、方差一趟），虽然 L2 命中但仍是开销。
+2. weight/bias 每个 Warp 都从全局内存读一次。
+
+v6 的解法：
+
+- **128bit 向量化访存**：一次加载 4 个 float（`float4` / `x128`），访存指令数减少到 1/4。
+- **共享内存缓存一切**：把 weight、bias、input 全部缓存到共享内存，后续两趟遍历都走共享内存，不再碰全局内存。
+- **2D Block 设计**：`<<<grid, (32, block_y)>>>`，一个 Block 里多个 Warp 共享 weight/bias——全 Block 合力加载一次，大家共用。
+
+```cuda
+__global__ void layernorm_forward_kernel6(...) {
+    extern __shared__ char params[];
+    x128* s_weight = reinterpret_cast<x128*>(params);
+    x128* s_bias   = s_weight + packs;
+    x128* s_inp    = s_weight + (2 + threadIdx.y) * packs;
+
+    // 全 Block 合力加载 weight/bias（只读一次 DRAM）
+    int tidx = threadIdx.y * WARP_SIZE + threadIdx.x;
+    for (int p = tidx; p < packs; p += blockDim.y * WARP_SIZE) {
+        s_weight[p] = load128(weight + p * x128::size);
+        s_bias[p]   = load128(bias   + p * x128::size);
+    }
+    __syncthreads();
+
+    // 第一趟：向量化加载 input，算均值 + 顺手缓存到共享内存
+    for (int p = threadIdx.x; p < packs; p += WARP_SIZE) {
+        x128 in_data = load128cs(inp + p * x128::size);
+        for (int k = 0; k < 4; k++) sum += (float)in_data[k];
+        s_inp[p] = in_data;  // 第二趟算方差直接从共享内存读
+    }
+    float m = warpReduceSum(sum) / C;
+
+    // 第二趟：从共享内存读 input 算方差（不碰 DRAM）
+    for (int p = threadIdx.x; p < packs; p += WARP_SIZE) {
+        x128 in_data = s_inp[p];
+        for (int k = 0; k < 4; k++) { float d = (float)in_data[k] - m; v += d * d; }
+    }
+    float s = rsqrtf(v / C + eps);
+
+    // 第三趟：全从共享内存读，向量化写回 DRAM
+    for (int p = threadIdx.x; p < packs; p += WARP_SIZE) {
+        x128 in_data = s_inp[p], w = s_weight[p], b = s_bias[p];
+        x128 out_data;
+        for (int k = 0; k < 4; k++)
+            out_data[k] = (s * ((float)in_data[k] - m)) * (float)w[k] + (float)b[k];
+        store128cs(out + p * 4, out_data);
     }
 }
 ```
 
-### 全尺寸性能对比
+### 共享内存用量
 
-![性能对比](images/gelu_ncu.png)
+C=768, block_y=4（一个 Block 4 个 Warp）：
 
-| 指标 (block=128) | 版本 1 | 版本 2 |
-| :--- | :--- | :--- |
-| Kernel耗时 | 133.66 µs | 40.67 µs |
-| 内存吞吐量 (Memory Throughput) | ~28.5% | ~90.5% |
-| 内存吞吐量 (Memory Throughput) | ~35.8% | ~73.7% |
-| 单线程寄存器 | 16 | 23 |
+| 区域 | 包数 (1包=16字节) | 大小 |
+|---|---|---|
+| weight | 768/4 = 192 | 3 KB |
+| bias | 192 | 3 KB |
+| input 缓存 | 4 × 192 = 768 | 12 KB |
+| **合计** | 1152 | **18 KB** |
 
-**带宽利用率从 28.5% 提升至 90.5%**，接近访存主导型算子的合理上限。
+> 当前配置下 18KB < 48KB 默认上限，不需要 `cudaFuncSetAttribute`。当 C 更大时（如 C=4096），共享内存可能超过 48KB，代码会通过 `cudaFuncSetAttribute` 手动申请，失败时自动回退到 v5。
 
-<br>
+### 效果
 
-## 优化原理
+- Memory Throughput 从 v3 的 74.53% 提升到 **83.39%**——接近 GPU 显存带宽物理上限。
+- Compute Throughput 降到 26.08%——这是好事，说明已经完全被带宽卡住了，计算不再是瓶颈。
+- 寄存器 42 个，比 v3 的 26 个多，但访存收益远大于寄存器占用带来的 Occupancy 损失。
 
-### 1. 访存向量化
+---
 
-比起单线程每次读写 2 字节，128bit 向量指令一次读写 16 字节，访存指令数减少 8 倍，压缩指令发射与调度开销，最大化显存总线利用率。
+## 优化路径总结
 
-### 2. 计算标量化
-GELU 包含 tanh 超越函数，计算部分逐个标量执行，并使用混合精度计算（BF16 → FP32 → BF16），计算过程提升到 FP32 保证精度
+```
+v1 (1.00ms)  朴素移植，串行循环，算力浪费
+  ↓ 把 C 维度并行化
+v2 (0.34ms)  三 Kernel 拆分，Block 级共享内存规约
+  ↓ 去掉跨 Warp 通信和中间写回
+v3 (0.12ms)  Warp 级 shuffle 规约，单 Kernel 完成
+  ↓ 尝试减少访存
+v4 (0.12ms)  单趟法 E[x²]−E[x]²，L2 缓存吃掉了收益
+  ↓ 适配大通道数
+v5 (0.15ms)  Block 级两级规约，C=768 时反而慢
+  ↓ 向量化 + 共享内存缓存
+v6 (0.11ms)  128bit 访存 + 共享内存复用，打满带宽
+```
 
-### 3. 缓存策略
+### 核心规律
 
-结合算子上下游场景选择缓存指令：
+1. **规约计算的层级越低越快**：Warp shuffle（寄存器）> Block 共享内存 > 全局内存。
+2. **能在单 Kernel 里做完就别拆**：中间结果写回再读回的代价，往往大于并行化的收益。
+3. **访存受限算子的终极优化是减少 DRAM 访问次数**：v6 把 input 从读 2 次 DRAM 变成读 1 次，weight/bias 从每个 Warp 读一次变成全 Block 读一次。
+4. **实测数据比理论分析重要**：v4 理论上少一趟访存应该更快，但 L2 缓存让收益消失了——benchmark 才是真理。
 
-- **读：`load128cs` 流式加载**：输入数据仅读取一次，用完即弃，
-  不在 L1 长期驻留，避免缓存污染，为后续层留出缓存余量。
-- **写：`store128` 普通存储**：GELU 输出是下一层算子的输入，很快会被再次读取，
-  保留在缓存中可提升后续算子的缓存命中率。
+---
 
-<br>
+## 编译与运行
 
-## 后续优化方向
+```bash
+# 编译
+nvcc -O3 --use_fast_math layernorm_forward.cu -o layernorm_forward
 
-和残差连接一样，进行**算子融合**：将 GELU 与上游线性层 / 残差加法融合为一个 Kernel，
-直接消除中间张量的全局显存读写，在寄存器内完成计算，是 Transformer 推理的标准优化。
+# 运行指定版本（自动验证正确性 + benchmark）
+./layernorm_forward 1   # v1
+./layernorm_forward 3   # v3
 
-<br>
-<br>
-
-## 补充
-
-#### 和 residual 残差连接算子相比，同样是访存受限，同样的优化方式，为什么 gelu 的带宽只有近 91%，而 residual 能跑到 95%？
-
-![性能对比](images/gelu_ncu1.png)
-
->注：残差算子为双输入相加（2读1写），总访存量高于 GELU 的单输入（1读1写），绝对耗时不具备直接可比性，对比重点为带宽利用率与计算密度的相对关系。
-
-| 指标（block=128） | 残差算子 | GELU 算子 |
-| :--- | :---: | :---: |
-| 耗时 | 79.52 μs | 40.67 μs |
-| 计算吞吐量 (Compute Throughput) | ~29% | **~74%** |
-| 内存吞吐量 (Memory Throughput) | **~95%** | ~90.5% |
-| 每元素计算量 | 1 次加法 | 三次方 + tanh + 多次乘加 |
-
->GELU 整体仍是访存受限型，但**计算密度显著高于纯访存算子**，导致了带宽利用率的差距。
-
-**性能对比：左边是residual，右边是gelu，blocksize 都选自 128**
-
-![性能对比](images/gelu_ncu2.png)
-
-#### 性能分析：计算延迟打断了访存指令的连续发射
-
-**1. 残差算子：纯粹的“内存等待者”**
-
-残差算子计算极其简单（仅一次加法），其 Warp State 显示 `Stall Long Scoreboard`（等访存返回）高达 **36.77**，而 `Stall Not Selected`（等待发射）仅为 **0.27**。说明 SM 的指令发射端极空闲，LSU 可以像机关枪一样连续发射 `LDG.128` 访存指令，DRAM 总线被持续喂饱，轻松达到 95% 的物理极限。
-
-**2. GELU 算子：计算管线引发“交通拥堵”**
-
-GELU 包含 `tanhf` 超越函数，指令流中混杂了大量的 `Control`、`Miscellaneous`。导致：
-* **计算管线拥塞**：`XU`（SFU）利用率升至 **25.62%**，`Shared FMA Heavy` 达到 **51.31%**。虽然未达 100%，但长延迟的 SFU 指令导致 Warp 在 `Math Pipe Throttle`（计算管线拥塞）和 `Short Scoreboard`（等计算完成）上停顿。
-* **发射端口拥挤**：`Stall Not Selected` 从 0.27 增至 **2.39**，`Stall Math Pipe Throttle` 从 0.21 增至 **0.74**。SM 每周期只能发射有限条指令，当大量 Warp 都在排队等待发射计算指令和控制指令时，LSU 就无法连续发射访存请求。
-* **总线空泡**：访存请求队列的接续被打断，DRAM 总线出现微小空泡，最终导致带宽从 95% 降至 91%。
-
-#### 结论
-GELU 达不到 residual 那样的带宽，**是因为它的计算复杂度稀释了访存指令的密度，并在流水线中产生了计算延迟，导致访存指令无法连续发射喂饱总线。**
+# NCU 性能剖析（需先编译带 -lineinfo）
+nvcc -O3 -lineinfo --use_fast_math layernorm_forward.cu -o layernorm_forward
+ncu --set full --launch-skip 16 --launch-count 8 -o layernorm_profile ./layernorm_forward 0 profile
+```

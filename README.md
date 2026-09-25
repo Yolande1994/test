@@ -276,6 +276,7 @@ v6 的解法：
 ```cuda
 __global__ void layernorm_forward_kernel6(...) {
     extern __shared__ char params[];
+    int packs = C / x128::size; // 每行数据需要的 x128 包的数量
     x128* s_weight = reinterpret_cast<x128*>(params);
     x128* s_bias   = s_weight + packs;
     x128* s_inp    = s_weight + (2 + threadIdx.y) * packs;

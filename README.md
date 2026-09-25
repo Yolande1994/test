@@ -83,7 +83,7 @@ __global__ void layernorm_forward_kernel1(
 
 ## v2 — 三 Kernel 拆分
 
-v1 的问题是通道维度 C 完全串行。v2 把 C 维度也并行化，将 LayerNorm 的均值计算、方差计算、归一化操作分别拆分为三个独立的 Kernel。：
+v1 的问题是通道维度 C 完全串行。v2 把 C 维度也并行化，将 LayerNorm 的均值计算、方差计算、归一化操作分别拆分为三个独立的 Kernel：
 
 1. **`mean_kernel`**：1 个 Block 处理 1 行，Block 内多线程分摊 C 个元素，用**共享内存二分规约**求均值。
 2. **`rstd_kernel`**：同理求方差倒数。

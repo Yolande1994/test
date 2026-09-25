@@ -52,6 +52,12 @@ __global__ void gelu_forward_kernel2(floatX* out, const floatX* inp, int N) {
 }
 ```
 
+### 全尺寸性能对比
+
+![性能对比](images/gelu_ncu.png)
+
+>不同 Block Size 下两个版本的耗时、带宽与计算吞吐量实测数据
+
 | 指标 | 版本 1 (block=128) | 版本 2 (block=128) |
 | :--- | :--- | :--- |
 | Kernel耗时 | 133.66 µs | 40.67 µs |
@@ -60,12 +66,6 @@ __global__ void gelu_forward_kernel2(floatX* out, const floatX* inp, int N) {
 | 单线程寄存器 | 16 | 23 |
 
 **带宽利用率从 28.5% 提升至 90.5%**，接近访存主导型算子的合理上限。
-
-### 全尺寸性能对比
-
-![性能对比](images/gelu_ncu.png)
-
->不同 Block Size 下两个版本的耗时、带宽与计算吞吐量实测数据
 
 <br>
 

@@ -81,6 +81,7 @@ __global__ void layernorm_forward_kernel1(float* out, float* mean, float* rstd,
 - Compute Throughput 只有 5.83%——几乎没用到算力，纯粹被串行循环卡住了。
 
 <br>
+
 ---
 
 ## v2 — 三 Kernel 拆分

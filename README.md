@@ -294,7 +294,7 @@ v5 在 C=768 时不是最优，原因：
 
 v3 已经很快了，但还有两个浪费：
 1. input 读了两次（均值一趟、方差一趟），就算 L2 命中也仍是开销。
-2. weight/bias 每个 Warp 都从全局内存读一次。
+2. weight/bias 每个 Warp 都要从全局内存读一次。
 
 v6 的解法：
 
@@ -362,6 +362,7 @@ C=768, block_y=4（一个 Block 4 个 Warp）：
 - Memory Throughput 从 v3 的 74.53% 提升到 **83.39%**——接近 GPU 显存带宽物理上限。
 - Compute Throughput 降到 26.08%——这是好事，说明已经完全被带宽卡住了，计算不再是瓶颈。
 - 寄存器 42 个，比 v3 的 26 个多，但访存收益远大于寄存器占用带来的 Occupancy 损失。
+>关于 Occupancy 对访存受限型算子的影响程度，详情可见我在 residual 的 README 中的描述
 
 ---
 

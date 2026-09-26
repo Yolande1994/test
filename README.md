@@ -304,7 +304,7 @@ v5 在 C=768 时不是最优，原因：
 
 ---
 
-## v6 — 工业级：共享内存 + 128bit 向量化
+## v6 — 共享内存 + 128bit 向量化
 
 v3 已经很快了，但还有两个浪费：
 1. input 读了两次（均值一趟、方差一趟），就算 L2 命中也仍是开销。
@@ -369,14 +369,14 @@ C=768, block_y=4（一个 Block 4 个 Warp）：
 | input 缓存 | 4 × 192 = 768 | 12 KB |
 | **合计** | 1152 | **18 KB** |
 
-> 当前配置下 18KB < 48KB 默认上限，不需要 `cudaFuncSetAttribute`。当 C 更大时（如 C=4096），共享内存可能超过 48KB，代码会通过 `cudaFuncSetAttribute` 手动申请，失败时自动回退到 v5。
+> 当前配置下 18KB < 48KB 默认上限，不需要 `cudaFuncSetAttribute`。当 C 更大时，共享内存可能超过 48KB，代码会通过 `cudaFuncSetAttribute` 手动申请，失败时自动回退到 v5。
 
 ### 效果
 
 - Memory Throughput 从 v3 的 74.53% 提升到 **83.39%**——接近 GPU 显存带宽物理上限。
 - Compute Throughput 降到 26.08%——这是好事，说明已经完全被带宽卡住了，计算不再是瓶颈。
 - 寄存器 42 个，比 v3 的 26 个多，但访存收益远大于寄存器占用带来的 Occupancy 损失。
->关于 Occupancy 对访存受限型算子的影响程度，详情可见我在 residual 的 README 中的描述
+>关于 Occupancy 对访存受限型算子的影响度，可见我在 residual 的 README 中的描述
 
 ---
 
@@ -410,7 +410,7 @@ v6 (0.11ms)  128bit 访存 + 共享内存复用，打满带宽
 
 ## 为什么 v4 相比 v3 没有提速？NCU 实测数据
 
-理论上 v4 少读一次 input 应该更快，但实测 v3 和 v4 耗时都是 0.12ms。
+理论上 v4 少读一次 input 应该更快，但在C=768的实测中 v3 和 v4 耗时都是 0.12ms。
 用 NCU 逐层拆解访存链路，原因展示：
 
 #### 第一层：L1 Cache

@@ -22,6 +22,8 @@ y = (x - E[x]) / sqrt(Var(x) + eps) * weight + bias
 
 ## 性能总览
 
+![全尺寸性能对比](images/layernorm_ncu.png)
+
 | 版本 | 核心实现 | 耗时 (ms) | Compute (%) | Memory (%) | 寄存器 |
 |:---:|---|:---:|:---:|:---:|:---:|
 | v1 | CPU 朴素移植，1 线程处理 1 行 | 1.00 | 5.83 | 63.58 | 40 |

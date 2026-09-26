@@ -150,6 +150,53 @@ __global__ void normalization_kernel(float* out, const float* inp,
     float xi = inp[idx];
     out[idx] = s * (xi - m) * weight[c] + bias[c];
 }
+
+// ── 分块一：算均值（Block 级共享内存二分规约）──
+__global__ void mean_kernel(float* mean, const float* inp, int N, int C, int block_size) {
+    extern __shared__ float shared[];
+    int idx = blockIdx.x;
+    int tid = threadIdx.x;
+    const float* x = inp + idx * C;
+
+    // 线程粗化：block 内 block_size 个线程分摊 C 个元素
+    float sum = 0.0f;
+    for (int i = tid; i < C; i += block_size) sum += x[i];
+    shared[tid] = sum;
+    __syncthreads();
+
+    // 二分规约：步长折半，每轮同步
+    for (int stride = block_size / 2; stride >= 1; stride /= 2) {
+        __syncthreads();
+        if (tid < stride) shared[tid] += shared[tid + stride];
+    }
+    if (tid == 0) mean[idx] = shared[0] / C;
+}
+
+// ── 分块二：算倒标准差（结构和 mean_kernel 完全一致，只是累加内容不同）──
+// 和 mean_kernel 唯一区别：循环里累加的是 (x[i] - mean[idx])^2，最后算 1/sqrt(...)
+// 中间结果 mean[idx] 从全局内存读回 —— 这就是三 Kernel 拆分的代价
+__global__ void rstd_kernel(float* rstd, const float* inp, const float* mean,
+                            int N, int C, int block_size) {
+    // ... 与 mean_kernel 完全相同的规约结构 ...
+    // 区别仅在于：sum += (x[i] - m)^2，最终 rstd[idx] = 1/sqrt(sum/C + eps)
+}
+
+// ── 分块三：归一化（每个线程处理 1 个输出元素，全并行）──
+__global__ void normalization_kernel(float* out, const float* inp, float* mean, float* rstd,
+                                     const float* weight, const float* bias, int B, int T, int C) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int bt = idx / C;      // 属于哪个 token
+    int c  = idx % C;      // 通道下标
+
+    float m = mean[bt];    // 查分块一的结果
+    float s = rstd[bt];    // 查分块二的结果
+    out[idx] = s * (inp[idx] - m) * weight[c] + bias[c];
+}
+
+// 三个 Kernel 在主函数中串行调用：
+mean_kernel<<<N, block_size, block_size * sizeof(float)>>>(mean, inp, N, C, block_size);
+rstd_kernel<<<N, block_size, block_size * sizeof(float)>>>(rstd, inp, mean, N, C, block_size);
+normalization_kernel<<<grid_norm, 256>>>(out, inp, mean, rstd, weight, bias, B, T, C);
 ```
 
 ### 提升与问题

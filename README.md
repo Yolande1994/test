@@ -80,6 +80,7 @@ __global__ void layernorm_forward_kernel1(float* out, float* mean, float* rstd,
 - **读 input 三次**（均值、方差、归一化各一趟），访存效率低。
 - Compute Throughput 只有 5.83%——几乎没用到算力，纯粹被串行循环卡住了。
 
+<br>
 ---
 
 ## v2 — 三 Kernel 拆分
@@ -148,6 +149,7 @@ normalization_kernel<<<grid_norm, 256>>>(out, inp, mean, rstd, weight, bias, B, 
 
 > 观察 mean_kernel 和 rstd_kernel 的 Memory Throughput 都达到了 ~84%，说明纯访存操作本身已经很高效。瓶颈不在带宽，而在**Kernel 拆分带来的额外全局读写和同步**。
 
+<br>
 ---
 
 ## v3 — Warp 级两趟法：去掉共享内存和中间写回
@@ -208,6 +210,7 @@ __global__ void layernorm_forward_kernel3(
 
 Warp 级规约的延迟只有几个时钟周期（shuffle 是硬件指令），而 Block 级共享内存规约需要多次 `__syncthreads()`，延迟高一个数量级。
 
+<br>
 ---
 
 ## v4 — 单趟法：理论上更快，然而...
@@ -248,6 +251,7 @@ float s = rsqrtf(var + 1e-5f);
 
 > **选型判断**：训练用 v3（两趟法数值稳定）；推理可以用 v4（推理对精度损失不敏感，效率优先）。
 
+<br>
 ---
 
 ## v5 — Block 级两级规约：解决大通道数问题
@@ -292,6 +296,7 @@ v5 在 C=768 时不是最优，原因：
 
 > **结论**：C 很小时 Warp 级并行更优；C 很大时 Block 级并行更优，C 越大优势越明显。
 
+<br>
 ---
 
 ## v6 — 工业级：共享内存 + 128bit 向量化

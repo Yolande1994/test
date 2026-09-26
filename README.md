@@ -44,8 +44,7 @@ y = (x - E[x]) / sqrt(Var(x) + eps) * weight + bias
 最直观的写法：在 B、T 维度并行，一个 GPU 线程负责一个 token，通道维度 C 仍然串行遍历。
 
 ```cuda
-__global__ void layernorm_forward_kernel1(
-    float* out, float* mean, float* rstd,
+__global__ void layernorm_forward_kernel1(float* out, float* mean, float* rstd,
     const float* inp, const float* weight, const float* bias, int N, int C) {
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -238,13 +237,16 @@ float s = rsqrtf(var + 1e-5f);
 
 ### 实测：和 v3 一样快（0.12ms），为什么？
 
-理论上少读一次 input 应该更快，但数据打平了。这里列出三个原因：
+理论上少读一次 input 应该更快，但数据打平了。这里列出二个原因（**详细评测过程放在末尾**）：
 
 1. **L2 缓存吃掉了收益**：v3 第二趟读 input 时，数据还在 L2 里（整个 input 约 25MB，RTX 5060 的 L2 缓存足够大），根本没去读 DRAM。v4 省下的那次 L2 读取，收益微乎其微。
 2. **计算依赖链变长**：同时累加 sum 和 sum2，指令并行度下降，Compute Throughput 从 57.09% 降到 47.26%。
-3. **数值稳定性代价**：当输入数值大但方差小时（比如所有值都是 10000.1），`E[x²]` 和 `E[x]²` 都是上亿的大数，两个大数相减会丢精度，甚至算出负方差导致 NaN。
 
-> **工程选型**：训练用 v3（两趟法，数值稳）；推理可以用 v4（精度损失不敏感，少一趟访存）。
+**单趟法公式的代价：数值稳定性差**
+
+当输入数值大但方差小时（比如所有值都是 10000.1），`E[x²]` 和 `E[x]²` 都是上亿的大数，两个大数相减会丢精度，甚至算出负方差导致 NaN。
+
+> **选型判断**：训练用 v3（两趟法，数值稳）；推理可以用 v4（精度损失不敏感，少一趟访存）。
 
 ---
 
@@ -387,3 +389,51 @@ v6 (0.11ms)  128bit 访存 + 共享内存复用，打满带宽
 4. **实测数据比理论分析重要**：v4 理论上少一趟访存应该更快，但实测没有超过v3——benchmark 才是真理。
 
 ---
+
+<br>
+<br>
+
+### 为什么 v4 没提速？NCU 实测数据
+
+理论上 v4 少读一次 input 应该更快，但实测 v3 和 v4 耗时都是 0.12ms。
+用 NCU 逐层拆解访存链路，原因展示：
+
+#### 第一层：L1 Cache
+
+**v3（两趟法）**——L1 发出 120 MB load 请求：
+
+![v3 L1 Cache](images/layernorm1.png)
+
+**v4（单趟法）**——L1 只发出 96 MB load 请求：
+
+![v4 L1 Cache](images/layernorm2.png)
+
+v3 确实多读了一趟（983,040 vs 786,432 条 load 指令，差 24 MB）。
+问题是：这 24 MB 走到 DRAM 了吗？
+
+#### 第二层：L2 Cache → DRAM
+
+**v3（两趟法）**：
+
+![v3 L2 + DRAM](images/layernorm3.png)
+
+**v4（单趟法）**：
+
+![v4 L2 + DRAM](images/layernorm4.png)
+
+关键数据对比：
+
+| 指标 | v3（两趟法） | v4（单趟法） |
+|---|---|---|
+| L2 Load Hit Rate | **51.45%** | 37.60% |
+| L2 → DRAM Load Sectors | **786,624** | **786,624** |
+| DRAM 实际 Load Bytes | **24 MB** | **24 MB** |
+
+v3 比 v4 多发了 372,476 个 sectors 到 L2，而 v3 在 L2 里正好多命中了 372,476 个 sectors。
+**v3 多读的那一趟，100% 在 L2 层就被缓存接住了，一个字节都没走到 DRAM。**
+
+#### 结论
+
+这个算子是访存受限的，瓶颈在 DRAM 带宽（两者都跑到了 ~75%）。
+v4 省掉的那趟遍历省的是 L2 读取（纳秒级），不是 DRAM 读取（百纳秒级），对最终性能没有影响。
+同时 v4 因为同时累加 sum 和 sum2，计算依赖链变长，访存流水线利用率从 57.09% 降到 47.26%，刚好和省下的访存抵消。

@@ -252,11 +252,12 @@ float s = rsqrtf(var + 1e-5f);
 
 ## v5 — Block 级两级规约：解决大通道数问题
 
-v3 的局限：1 个 Warp 只有 32 个线程，当 C 很大时（如 C=4096），每个线程要循环 128 次，并行度不够。
+v3 的局限：1 个 Warp 处理 1 行，只有 32 个线程，当 C 很大时，每个线程要循环很多次，并行度不够。
 
-v5 回到 Block 级：1 个 Block 处理 1 行，用更多线程分摊。但又不能像 v2 那样纯走共享内存——所以用上**两级规约**：
+v5 回到 Block 级：1 个 Block 处理 1 行，用更多线程分摊。同时使用**两级规约**，也不像 v2 那样纯走共享内存。
 
 ```
+两级规约流程：
 每个线程先算局部 sum
     → Warp 内 shuffle 规约（32 线程一组，走寄存器）
     → 各 Warp 的结果写入共享内存（只写 num_warps 个 float）
@@ -282,11 +283,10 @@ float block_sum = cg::reduce(warp, warp_sum, cg::plus<float>{});
 
 v5 在 C=768 时不是最优，原因：
 
-1. **多了 `__syncthreads()` 同步**：Warp 之间要等齐。
-2. **C=768 不大**：32 个线程每个循环 24 次，已经足够并行，Block 级的优势体现不出来。
-3. **v5 用的是单趟法**（和 v4 一样 `E[x²]-E[x]²`），计算依赖链更长，Compute Throughput 虽高但实际延迟没优势。
+1. **C=768 不大**：32 个线程每个循环 24 次，已经足够并行，Block 级的优势体现不出来。
+2. **多了 `__syncthreads()` 同步开销**：Warp 之间要等齐。
 
-> **结论**：C ≤ 1024 时 Warp 级（v3）更优；C ≥ 4096 时 Block 级两级规约（v5）更能打满算力。
+> **结论**：C 很小时 Warp 级（v3）更优；C 很大时 Block 级两级规约（v5）更能打满算力。
 
 ---
 
@@ -300,7 +300,7 @@ v6 的解法：
 
 - **128bit 向量化访存**：一次加载 4 个 float（`float4` / `x128`），访存指令数减少到 1/4。
 - **全部装进共享内存**：把 weight、bias、input 全部缓存到共享内存，后续两趟遍历都走共享内存，不再碰全局内存。
-- **2D Block 设计**：`<<<grid, (32, block_y)>>>`，一个 Block 里多个 Warp 共享 weight/bias——全 Block 合力加载一次，大家共用。
+- **2D Block 设计**：`<<<grid, (32, block_y)>>>`，一个 Block 里多个 Warp 共享 weight/bias——全 Block 合力加载一次，后续共用。
 
 ```cuda
 __global__ void layernorm_forward_kernel6(...) {

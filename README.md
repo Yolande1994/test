@@ -92,7 +92,7 @@ v1 的问题是通道维度 C 完全串行。v2 把 C 维度也并行化，将 L
 3. **`normalization_kernel`**：展开成并行——每个线程处理 1 个输出元素。
 
 ```cuda
-// ── 分块一：算均值（Block 级共享内存二分规约）──
+// 分块一：算均值（Block 级共享内存二分规约）
 __global__ void mean_kernel(float* mean, const float* inp, int N, int C, int block_size) {
     extern __shared__ float shared[];
     int idx = blockIdx.x;
@@ -113,14 +113,14 @@ __global__ void mean_kernel(float* mean, const float* inp, int N, int C, int blo
     if (tid == 0) mean[idx] = shared[0] / C;
 }
 
-// ── 分块二：算倒标准差（结构和 mean_kernel 完全一致，只是累加内容不同）──
+// 分块二：算倒标准差（结构和 mean_kernel 完全一致，只是累加内容不同）
 __global__ void rstd_kernel(float* rstd, const float* inp, const float* mean, int N, int C, int block_size) {
     // ... 与 mean_kernel 完全相同的规约结构 ...
     // 中间结果 mean[idx] 从全局内存读回
     // 区别仅在于：sum += (x[i] - m)^2，最终 rstd[idx] = 1/sqrt(sum/C + eps)
 }
 
-// ── 分块三：归一化（每个线程处理 1 个输出元素，全并行）──
+// 分块三：归一化（每个线程处理 1 个输出元素，全并行）
 __global__ void normalization_kernel(float* out, const float* inp, float* mean, float* rstd,
                                      const float* weight, const float* bias, int B, int T, int C) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;

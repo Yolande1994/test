@@ -22,7 +22,7 @@ y = (x - E[x]) / sqrt(Var(x) + eps) * weight + bias
 
 ## 性能总览
 
-![全尺寸性能对比](images/layernorm_ncu.png)
+![全尺寸性能对比](images/layernorm.png)
 
 | 版本 | 核心实现 | 耗时 (ms) | Compute (%) | Memory (%) | 寄存器 |
 |:---:|---|:---:|:---:|:---:|:---:|
@@ -288,7 +288,7 @@ v5 在 C=768 时不是最优，原因：
 
 ### 附上 C=4096 时的测试结果，此时 v5 超越了 v3（0.88 vs 1.01）
 
-![全尺寸性能对比](images/layernorm_ncu.png)
+![全尺寸性能对比](images/layernorm5.png)
 
 > **结论**：C 很小时 Warp 级并行更优；C 很大时 Block 级并行更优，C 越大优势越明显。
 

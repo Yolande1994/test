@@ -151,6 +151,7 @@ normalization_kernel<<<grid_norm, 256>>>(out, inp, mean, rstd, weight, bias, B, 
 > 观察 mean_kernel 和 rstd_kernel 的 Memory Throughput 都达到了 ~84%，说明纯访存操作本身已经很高效。瓶颈不在带宽，而在**Kernel 拆分带来的额外全局读写和同步**。
 
 <br>
+
 ---
 
 ## v3 — Warp 级两趟法：去掉共享内存和中间写回
@@ -212,6 +213,7 @@ __global__ void layernorm_forward_kernel3(
 Warp 级规约的延迟只有几个时钟周期（shuffle 是硬件指令），而 Block 级共享内存规约需要多次 `__syncthreads()`，延迟高一个数量级。
 
 <br>
+
 ---
 
 ## v4 — 单趟法：理论上更快，然而...
@@ -253,6 +255,7 @@ float s = rsqrtf(var + 1e-5f);
 > **选型判断**：训练用 v3（两趟法数值稳定）；推理可以用 v4（推理对精度损失不敏感，效率优先）。
 
 <br>
+
 ---
 
 ## v5 — Block 级两级规约：解决大通道数问题
@@ -298,6 +301,7 @@ v5 在 C=768 时不是最优，原因：
 > **结论**：C 很小时 Warp 级并行更优；C 很大时 Block 级并行更优，C 越大优势越明显。
 
 <br>
+
 ---
 
 ## v6 — 工业级：共享内存 + 128bit 向量化
@@ -399,10 +403,10 @@ v6 (0.11ms)  128bit 访存 + 共享内存复用，打满带宽
 3. **访存受限算子的终极优化是减少 DRAM 访问次数**：v6 把 input 从读 2 次 DRAM 变成读 1 次，weight/bias 从每个 Warp 读一次变成全 Block 读一次。
 4. **实测数据比理论分析重要**：v4 理论上少一趟访存应该更快，但实测没有超过v3——benchmark 才是真理。
 
----
+<br>
+<br>
 
-<br>
-<br>
+---
 
 ## 为什么 v4 相比 v3 没有提速？NCU 实测数据
 

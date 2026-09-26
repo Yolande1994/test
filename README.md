@@ -92,7 +92,7 @@ v1 的问题是通道维度 C 完全串行。v2 把 C 维度也并行化，将 L
 3. **`normalization_kernel`**：展开成并行——每个线程处理 1 个输出元素。
 
 ```cuda
-// mean_kernel 核心：Block 级共享内存二分规约
+// 分块一：算均值
 __global__ void mean_kernel(float* mean, const float* inp, int N, int C, int block_size) {
     extern __shared__ float shared[];
     int idx = blockIdx.x;
@@ -111,11 +111,50 @@ __global__ void mean_kernel(float* mean, const float* inp, int N, int C, int blo
     }
     if (tid == 0) mean[idx] = shared[0] / C;
 }
+
+// 分块二：算倒标准差（结构和 mean_kernel 几乎一样）
+__global__ void rstd_kernel(float* rstd, const float* inp, const float* mean,
+                            int N, int C, int block_size) {
+    extern __shared__ float shared[];
+    int idx = blockIdx.x;
+    int tid = threadIdx.x;
+    const float* x = inp + idx * C;
+    float m = mean[idx];           // ← 从上一个 Kernel 读回中间结果
+
+    float sum = 0.0f;
+    for (int i = tid; i < C; i += block_size) {
+        float diff = x[i] - m;
+        sum += diff * diff;
+    }
+    shared[tid] = sum;
+    __syncthreads();
+
+    for (int stride = block_size / 2; stride >= 1; stride /= 2) {
+        __syncthreads();
+        if (tid < stride) shared[tid] += shared[tid + stride];
+    }
+    if (tid == 0) rstd[idx] = 1.0f / sqrtf(shared[0] / C + 1e-5f);
+}
+
+// 分块三：归一化（每个线程并行处理 1 个输出元素）
+__global__ void normalization_kernel(float* out, const float* inp,
+                                    float* mean, float* rstd,
+                                    const float* weight, const float* bias,
+                                    int B, int T, int C) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;  // 全局元素编号 [0, B*T*C)
+    int bt = idx / C;       // 属于哪个 token
+    int c  = idx % C;       // 通道下标
+
+    float m = mean[bt];     // 查之前写好的中间结果
+    float s = rstd[bt];
+    float xi = inp[idx];
+    out[idx] = s * (xi - m) * weight[c] + bias[c];
+}
 ```
 
-### 进步与问题
+### 提升与问题
 
-**进步**：C 维度并行起来了，耗时从 1.00ms 降到 0.34ms。
+**提升**：C 维度并行起来了，耗时从 1.00ms 降到 0.34ms。
 
 **问题**：
 1. **三个 Kernel 串行启动**，有多次启动开销。
@@ -133,7 +172,7 @@ v2 的核心痛点是"跨 Warp 通信必须走共享内存"。那如果**一个 
 - **任务划分**：1 个 Warp = 1 个 Token，32 个线程分摊 C=768 个元素。
 - **规约方式**：Warp 内 32 线程通信走**硬件 shuffle 指令**（`__shfl_down_sync`），直接互读寄存器，不需要共享内存，不需要 `__syncthreads()`。
 - **单 Kernel 完成全部计算**：均值、方差、归一化在同一个 Kernel 里完成，中间结果留在寄存器，不写回全局内存。
-- **流式访存**：输入读一次就不再用，用 `__ldcs` 绕过缓存，给 weight/bias 留出 L2 空间。
+- **流式访存**：输入读一次就不再用，用 `__ldcs` 绕过缓存，给 weight/bias 留出缓存空间。
 
 ```cuda
 __global__ void layernorm_forward_kernel3(

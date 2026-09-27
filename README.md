@@ -71,6 +71,8 @@ __global__ void layernorm_forward_kernel1(...) {
 2. **两个 Kernel 串行启动**，存在启动开销。
 3. LayerNorm 部分 1 个线程串行跑 C=768 次循环，并行度太低，Compute Throughput 只有 4.49%。
 
+<br>
+
 ---
 
 ## v2 — 朴素融合：反而更慢？
@@ -113,7 +115,7 @@ v1 的 layernorm_kernel 同样是 1 线程处理 1 个 Token，访存不合并�
 但它读取的 residual 是 residual_kernel 刚写入的结果，仍驻留在 L2 缓存中，未访问 DRAM。
 
 不合并访存的开销发生在 L2 层面，对整体性能影响有限。
->关于数据驻留于 L2 的案例，可阅读 LayerNorm 文件 README 中末尾的内容 
+>数据驻留 L2 这一现象的 NCU 报告分析可见 LayerNorm 算子 README 末尾
 
 #### v2 的问题
 
@@ -128,19 +130,23 @@ GPU 内存事务的最小粒度为 32 字节（一个 Cache Line）：
 
 v1 通过 residual_kernel 以合并访存方式仅用 0.14ms 就读完了 inp1 和 inp2。
 
-v2 将相同的读取放入不合并循环，带宽利用率降至原来的 1/8——多出 1.12ms 耗时来源。
+v2 将相同的读取放入不合并循环，带宽利用率降至原来的 1/8——多出 1.12ms 耗时。
 
 > **教训**：融合须建立在合并访存的基础上，否则性能可能更差。
 >- v1 的两个 Kernel 虽然串行，但各自的访问模式与数据特性匹配：合并访存处理输入张量，不合并访存读取 L2 缓存。盲目融合会破坏这种匹配关系。
 >- v3 通过调整任务划分（1 Warp 处理 1 Token）恢复合并访存，耗时即从 2.56ms 降至 0.17ms。
 
+<br>
+
 ---
 
 ## v3 — Warp 级融合：恢复合并访存
 
-v2 的问题是"1 个线程处理 1 个 Token"。v3 改为**1 个 Warp（32 线程）处理 1 个 Token**：
+v2 的问题是"1 个线程处理 1 个 Token"。
 
-- Warp 内 32 个线程用跨步循环 `for (c = threadIdx.x; c < C; c += 32)` 分摊同一行。
+v3 改为**1 个 Warp（32 线程）处理 1 个 Token**：
+
+- Warp 内 32 个线程跨步循环 `for (c = threadIdx.x; c < C; c += 32)` 共同分摊一行。
 - 线程 0 访问 c=0, 32, 64...；线程 1 访问 c=1, 33, 65...——**地址连续，完美合并**。
 - Warp 内规约用 `warpReduceSum`（基于 `__shfl_down_sync`），纯寄存器通信，无需共享内存。
 
@@ -176,15 +182,17 @@ __global__ void fused_forward_kernel3(...) {
 
 ### 效果
 
-- 耗时从 v2 的 2.56ms 降到 **0.17ms**——15 倍提升，全靠恢复合并访存。
-- Compute Throughput 从 4.54% 升到 50.22%——GPU 终于在干活了。
+- 耗时从 v2 的 2.56ms 降到 **0.17ms**——15 倍提升，恢复合并访存的同时增加了并行度的功劳。
+- Compute Throughput 从 4.54% 升到 50.22%——终于在干活了。
 - Memory Throughput 64.62%——还有提升空间。
 
 ### 现存问题
 
-1. **标量访存**：每次加载 4 字节（1 个 float），访存指令数多。
+1. **标量访存**：单线程每次加载 1 个 float（4 字节），访存指令数多。
 2. **residual 写了又读**：第一趟写 residual 到全局内存，第二趟又读回来。
 3. **weight/bias 每个 Token 都重新读**，没有缓存复用。
+
+<br>
 
 ---
 
@@ -192,7 +200,7 @@ __global__ void fused_forward_kernel3(...) {
 
 v3 已经很快了，v4 在四个维度同时优化：
 
-### ① 128bit 向量化访存
+### 一. 128bit 向量化访存
 
 用 `x128`（Packed128）一次加载 4 个 float，访存指令数减少到 1/4：
 
@@ -201,9 +209,9 @@ const x128 in1 = load128cs(inp1 + c);  // 一次读 4 个 float
 const x128 in2 = load128cs(inp2 + c);
 ```
 
-### ② 单遍统计：省掉第二趟读 residual
+### 二. 单遍统计：省掉第二趟读 residual
 
-用方差公式 `Var(x) = E[x²] - E[x]²`，第一趟同时累加 `sum` 和 `sum_sq`：
+用方差公式 `Var(x) = E[x²] - E[x]²`，读一趟同时累加 `sum` 和 `sum_sq`：
 
 ```cuda
 for (int c = threadIdx.x * 4; c < C; c += 32 * 4) {
@@ -212,22 +220,22 @@ for (int c = threadIdx.x * 4; c < C; c += 32 * 4) {
     x128 out;
     for (int k = 0; k < 4; ++k) {
         out[k] = in1[k] + in2[k];
-        sum += out[k];
-        sum_sq += out[k] * out[k];  // 平方和
+        sum += out[k];              // 元素总和 → 用于算均值
+        sum_sq += out[k] * out[k];  // 平方和   → 用于算方差
     }
     store128(residual + c, out);
 }
-float m = sum / C;
-float v = sum_sq / C - m * m;  // 单遍方差
+float m = sum / C;             // 均值
+float v = sum_sq / C - m * m;  // 方差（单趟求出）
 ```
 
-### ③ 流式访存（`__ldcs` / `__stcs`）
+### 三. 流式访存（`__ldcs` / `__stcs`）
 
-- `load128cs`：input 和 residual 只读一次，不驻留缓存（Streaming）。
+- `load128cs`：input 和 residual 只读一次，用流式（Streaming）不驻留缓存。
 - `load128`（不带 cs）：weight/bias 是全局共享的，保留在缓存中供所有 Token 复用。
 - `store128cs`：normed 写完就不需要了，流式存储不污染缓存。
 
-### ④ 锯齿形（Zigzag）遍历
+### 四. 锯齿形（Zigzag）遍历
 
 第一趟从前往后写 residual，第二趟**从后往前读**：
 
@@ -239,31 +247,42 @@ for (; c >= 0; c -= 32 * 4) {
 }
 ```
 
-第一趟最后写入的 residual 尾部数据还在 L2 缓存里，第二趟一上来就读到它们——利用 LRU 缓存特性提升命中率。
+第一趟最后写入的 residual 尾部数据还在 L2 缓存里，第二趟一上来就读它们，有助于提升缓存命中率。
 
 ### 效果
 
 - 耗时从 0.17ms 降到 **0.10ms**。
-- Memory Throughput 从 64.62% 升到 **85.95%**——接近显存带宽物理上限。
-- Compute Throughput 58.23%——已经被带宽卡住。
+- Memory Throughput 从 64.62% 升到 **85.95%**。
 
-> **数值稳定性提醒**：单遍公式 `E[x²]-E[x]²` 在输入数值大但方差小时会丢精度（大数相减）。推理场景可接受，训练场景建议用两趟法。
+> **数值稳定性提醒**：单遍公式 `E[x²]-E[x]²` 在输入数值大但方差小时会丢精度（大数相减）。推理场景可接受，训练场景还是用两趟法。
+
+<br>
 
 ---
 
 ## v5 — 全共享内存缓存
 
-v4 还有两个浪费：
-1. weight/bias 每个 Token 都从全局内存读一次。
-2. residual 虽然用了锯齿循环，但本质上还是走了一次全局内存。
+v4 还有几个待提升问题：
+1. weight/bias 每个 Token 都从全局内存读一次，重复读取。
+2. residual 虽然用了锯齿循环，但本质上还是一次全局内存读取。
+3. 单遍方差公式 E[x²]-E[x]² 存在大数相减时的精度损失。
 
-v5 的解法：**把 weight、bias、residual 全部缓存到共享内存**。
+v5 **把 weight、bias、residual 全部缓存到共享内存**。
+
+### 共享内存布局
+
+| 区域 | 大小（C=768, block_y=4） |
+|---|---|
+| s_weight | 768 × 4B = 3 KB |
+| s_bias | 768 × 4B = 3 KB |
+| s_res（4 个 Warp 各一份） | 4 × 768 × 4B = 12 KB |
+| **合计** | **18 KB** |
 
 ```cuda
 extern __shared__ char params[];
-x128* s_weight = ...;   // 全 Block 共享
-x128* s_bias   = ...;   // 全 Block 共享
-x128* s_res    = ...;   // 每个 Warp 私有
+x128* s_weight = ...;   // 全 Block 共享 weight
+x128* s_bias   = ...;   // 全 Block 共享 bias
+x128* s_res    = ...;   // 每个 Warp 一份私有的残差缓存
 
 // 全 Block 合力加载 weight/bias（只读一次 DRAM）
 for (int i = sidx; i < C; i += blockDim.y * 32 * 4) {
@@ -279,26 +298,19 @@ for (int c = threadIdx.x * 4; c < C; c += 32 * 4) {
     x128 out;
     for (int k = 0; k < 4; ++k) { out[k] = in1[k] + in2[k]; sum += out[k]; }
     store128cs(residual + c, out);  // 写 DRAM（反向传播需要）
-    s_res[c/4] = out;              // 写共享内存（后续三趟都从这里读）
+    s_res[c/4] = out;               // 写共享内存（后续三趟都从这里读）
 }
 
-// 第二趟、第三趟：全部从共享内存读，零全局访存
+// 第二趟、第三趟：全部从共享内存读数据，零全局访存
 ```
-
-### 共享内存布局
-
-| 区域 | 大小（C=768, block_y=4） |
-|---|---|
-| s_weight | 768 × 4B = 3 KB |
-| s_bias | 768 × 4B = 3 KB |
-| s_res（4 个 Warp 各一份） | 4 × 768 × 4B = 12 KB |
-| **合计** | **18 KB** |
 
 ### 效果
 
 - 耗时 **0.10ms**，和 v4 持平。
 - 为什么没有更快？因为 v4 的锯齿循环已经把 residual 的 L2 命中率做得很好了，共享内存缓存的收益被 L2 吃掉了。
 - v5 的真正价值：**用回了数值稳定的两趟法**（从共享内存读 residual 算方差，不依赖 `E[x²]-E[x]²`），同时不需要锯齿循环。
+
+<br>
 
 ---
 

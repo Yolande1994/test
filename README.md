@@ -338,25 +338,25 @@ for (int c = threadIdx.x * 4; c < C; c += 32 * 4) {
 
 ---
 
-## v6 — 三维 Block + 网格步长循环：生产级自适应设计
+## v6 — 三维 Block + 网格步长循环：生产级自适应
 
 v3~v5 都是"1 个 Warp 处理 1 个 Token"。v6 引入了两个生产级设计：
 
-### ① 三维 Block：多 Warp 协作处理一个 Token
+### 一. 三维 Block：多 Warp 协作处理一个 Token
 
 ```
 dim3(32, block_y, block_z)
-  blockDim.x = 32        → 一个 Warp
+  blockDim.x = 32               → 一个 Warp
   blockDim.y = warps_per_token  → 一个 Token 用几个 Warp
-  blockDim.z = tokens_per_block  → 一个 Block 同时处理几个 Token
+  blockDim.z = tokens_per_block → 一个 Block 同时处理几个 Token
 ```
 
 - C=768 时：`warps_per_token=1`，`tokens_per_block=4`（和 v5 一样）。
 - C=4096 时：`warps_per_token=4`，`tokens_per_block=1`——更多 Warp 协作分摊长行。
 
-这就是之前 LayerNorm 中讨论的"没有万能最优版本"的工程答案：**运行时根据 C 自动调整并行度**。
+这是 LayerNorm README 中讨论的"没有万能最优版本"的工程答案：**运行时根据 C 自动调整并行度**。
 
-### ② Grid-Stride Loop：固定块数 + 循环消化
+### 二. Grid-Stride Loop：固定块数 + 循环消化
 
 传统做法按数据量开块：`grid_size = N / tokens_per_block`。N 小时 SM 闲置，N 大时调度开销暴涨。
 
@@ -369,11 +369,12 @@ const int num_blocks = cuda_num_SMs * cuda_threads_per_SM / block_size;
 不管 N 是 1000 还是 10000，都只开刚好让 GPU 满载的块数，剩余 Token 靠 `for` 循环分批处理。
 
 ```cuda
-for (int tidx = blockIdx.x * blockDim.z + threadIdx.z; tidx < N;
-     tidx += gridDim.x * blockDim.z) {
+for (int tidx = blockIdx.x * blockDim.z + threadIdx.z; tidx < N; tidx += gridDim.x * blockDim.z) {
     // 处理 Token tidx
 }
 ```
+
+>更多详情见代码内注释
 
 ### 效果
 

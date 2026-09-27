@@ -25,7 +25,7 @@ normed   = (residual - mean) * rstd * weight + bias  # 归一化 + 缩放平移
 
 ---
 
-## 性能总览
+## 性能总览（block size = 128）
 
 ![全尺寸性能对比](images/fused.png)
 

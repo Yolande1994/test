@@ -326,7 +326,7 @@ for (int c = threadIdx.x * 4; c < C; c += 32 * 4) {
 
 **尺寸 block=256 时，v5 在 C=768/2048/4096 时的 Occupancy**
 
-![v5占用率](images/fused1.png)
+![v5占用率](images/fused2.png)
 
 受限于共享内存限制，v5 的性能会随 C 的变大而下降
 

@@ -328,7 +328,7 @@ for (int c = threadIdx.x * 4; c < C; c += 32 * 4) {
 
 ![v5占用率](images/fused2.png)
 
->受限于共享内存限制，v5 的 Occupancy 随着 C 的变大而下降；此时 v4 的 Occupancy 一致保持着 100%（未截图）
+>受限于共享内存限制，v5 的 Occupancy 随着 C 的变大而下降；而 v4 的 Occupancy 一致保持着 100%（未截图）
 
 **无论如何，v5 用 和 v4 相当的时间换来了比 v4 更好的精度，这是其重要的价值**
 

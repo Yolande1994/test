@@ -11,9 +11,9 @@
 Transformer 编码器中，残差连接和 LayerNorm 是两个连续操作：
 
 ```
-residual = inp1 + inp2                           # 残差连接
-mean   = Σ(residual) / C                         # 均值
-var    = Σ((residual - mean)²) / C               # 方差
+residual = inp1 + inp2                                        # 残差连接
+mean   = Σ(residual) / C                                      # 均值
+var    = Σ((residual - mean)²) / C                            # 方差
 normed = (residual - mean) / sqrt(var + eps) * weight + bias  # 归一化 + 缩放平移
 ```
 

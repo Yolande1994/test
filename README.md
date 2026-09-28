@@ -17,6 +17,18 @@ rstd     = 1 / sqrt(var(residual) + eps)         # 倒标准差
 normed   = (residual - mean) * rstd * weight + bias  # 归一化 + 缩放平移
 ```
 
+```
+# 残差连接
+
+residual = inp1 + inp2
+
+# LayerNorm 归一化 + 仿射变换
+
+mean   = Σ(residual) / C
+var    = Σ((residual - mean)²) / C
+normed = (residual - mean) / sqrt(var + eps) * weight + bias
+```
+
 **融合的价值**：如果不融合，中间结果 `residual`（B×T×C 大小）需要写回显存再被 LayerNorm 读回来，额外增加 2 次全局内存往返。
 
 融合后，`residual` 留在寄存器/共享内存中直接传递，大幅减少显存流量。

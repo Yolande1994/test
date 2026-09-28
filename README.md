@@ -18,12 +18,10 @@ normed   = (residual - mean) * rstd * weight + bias  # 归一化 + 缩放平移
 ```
 
 ```
-# 残差连接
-
+残差连接：
 residual = inp1 + inp2
 
-# LayerNorm 归一化 + 仿射变换
-
+LayerNorm 归一化 + 仿射变换：
 mean   = Σ(residual) / C
 var    = Σ((residual - mean)²) / C
 normed = (residual - mean) / sqrt(var + eps) * weight + bias

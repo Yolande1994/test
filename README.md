@@ -412,7 +412,7 @@ for (int tidx = blockIdx.x * blockDim.z + threadIdx.z; tidx < N; tidx += gridDim
 ### 优化路径总结
 
 ```
-v1 (1.44ms)  两个独立 Kernel，residual 写回 DRAM 再读回
+**v1 (1.44ms)**  两个独立 Kernel，residual 写回 DRAM 再读回
   ↓ 尝试融合消除中间写回
 v2 (2.56ms)  朴素融合，1 线程 1 Token → 访存不合并，反而更慢
   ↓ 改为 1 Warp 1 Token，恢复合并访存

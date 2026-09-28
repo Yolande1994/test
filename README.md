@@ -12,19 +12,9 @@ Transformer 编码器中，残差连接和 LayerNorm 是两个连续操作：
 
 ```
 residual = inp1 + inp2                           # 残差连接
-mean     = mean(residual)                        # 均值
-rstd     = 1 / sqrt(var(residual) + eps)         # 倒标准差
-normed   = (residual - mean) * rstd * weight + bias  # 归一化 + 缩放平移
-```
-
-```
-残差连接：
-residual = inp1 + inp2
-
-LayerNorm 归一化 + 仿射变换：
-mean   = Σ(residual) / C
-var    = Σ((residual - mean)²) / C
-normed = (residual - mean) / sqrt(var + eps) * weight + bias
+mean   = Σ(residual) / C                         # 均值
+var    = Σ((residual - mean)²) / C               # 方差
+normed = (residual - mean) / sqrt(var + eps) * weight + bias  # 归一化 + 缩放平移
 ```
 
 **融合的价值**：如果不融合，中间结果 `residual`（B×T×C 大小）需要写回显存再被 LayerNorm 读回来，额外增加 2 次全局内存往返。

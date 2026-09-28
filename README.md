@@ -57,10 +57,12 @@ __global__ void layernorm_forward_kernel1(float* out, float* mean, float* rstd,
     const float* x = inp + idx * C;
 
     // 三趟串行循环：均值 → 方差 → 归一化
+    // 第一趟：求均值
     float m = 0.0f;
     for (int i = 0; i < C; i++) m += x[i];
     m /= C;
 
+    // 第二趟：求方差
     float v = 0.0f;
     for (int i = 0; i < C; i++) {
         float d = x[i] - m;
@@ -69,6 +71,7 @@ __global__ void layernorm_forward_kernel1(float* out, float* mean, float* rstd,
     v /= C;
     float s = rsqrtf(v + 1e-5f);
 
+    // 第三趟：归一化
     float* o = out + idx * C;
     for (int i = 0; i < C; i++) {
         o[i] = s * (x[i] - m) * weight[i] + bias[i];

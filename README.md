@@ -27,9 +27,9 @@ normed   = (residual - mean) * rstd * weight + bias  # 归一化 + 缩放平移
 
 ## 性能总览
 
->默认测试配置：序列长度 N = 8192（Batch=8 × Tokens=1024），通道数 C = 768，block size = 128
+>**默认测试配置**：序列长度 N = 8192（Batch=8 × Tokens=1024），通道数 C = 768，block size = 128
 
->测试基准全仓库环境统一，详见根目录 README。
+>测试基准全仓库环境统一，详见根目录 README
 
 ![全尺寸性能对比](images/fused.png)
 

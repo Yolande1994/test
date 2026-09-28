@@ -161,7 +161,7 @@ normalization_kernel<<<grid_norm, 256>>>(out, inp, mean, rstd, weight, bias, B, 
 
 ---
 
-## v3 — Warp 级两趟法：去掉共享内存和中间写回
+## v3 — Warp 级并行：去掉共享内存和中间写回
 
 v2 的核心痛点是"跨 Warp 通信必须走共享内存"。那如果**一个 Warp（32 线程）独立处理一整行**呢？
 
@@ -190,7 +190,7 @@ __global__ void layernorm_forward_kernel3(
     sum = cg::reduce(warp, sum, cg::plus<float>{});  // shuffle 规约，无共享内存
     float m = sum / C;
 
-    // ── 第二趟：算方差（两趟法，数值稳定）──
+    // ── 第二趟：算方差──
     sum = 0.0f;
     for (int i = warp.thread_rank(); i < C; i += warp.size()) {
         float d = x[i] - m;

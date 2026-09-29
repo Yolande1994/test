@@ -1,472 +1,393 @@
-# LayerNorm Forward — CUDA 算子优化实战
+# Softmax Forward — CUDA 算子优化
 
-从 CPU 朴素移植到高性能向量化实现，记录 LayerNorm 前向传播算子在 GPU 上的 6 个版本迭代过程。
+从朴素的三趟遍历，到标准块级规约，再到在线 Softmax（Online Softmax），记录 Softmax 在 GPU 上的 9 个版本迭代过程。
+> 本仓库所有性能数据均采集自 Nsight Compute（`ncu --set full --cache-control all`）。NCU 单次采集含硬件计数器采样开销，绝对耗时略高于干净执行，跨版本结论基于同口径下的相对比较与硬件利用率指标。
 
 ---
 
 ## 算子简介
 
-LayerNorm 对每个 Token 的特征通道做归一化：
+对输入矩阵的每一行独立做 Softmax 归一化，将一行任意实数转换为总和为 1、取值在 0~1 之间的概率分布。输入 `inp` 维度为 `(N, C)`，其中 `N = B*T`（总 Token 数），`C` 为特征维度。
+
+标准做法需要三趟遍历一行：
 
 ```
-y = (x - E[x]) / sqrt(Var(x) + eps) * weight + bias
+maxval = max(row)                     # 第一趟：求行内最大值（避免 exp 上溢）
+sum    = Σ exp(row - maxval)          # 第二趟：计算指数并求和
+out    = exp(row - maxval) / sum      # 第三趟：归一化写回
 ```
 
-这是一个**访存受限型算子（Memory-Bound）**：
+**访存特征**：当 `C = 50257`（GPT-2 词表维度）时，单行数据量约 200 KB，远超 L2 缓存。整个算子需要把输入张量读一遍、输出张量写一遍，是典型的**访存受限型算子（Memory-Bound）**，优化核心是减少全局内存往返、提升访存合并率与带宽利用率。
 
-- **计算量**：均值规约 + 方差规约 + 逐元素归一化 + 缩放平移
-- **访存量**：读 input + 读 weight/bias + 写 output
-- **优化核心**：在规约计算和访存效率之间找平衡，尽可能打满显存带宽
+**数值稳定性**：`exp(x)` 在 `x > 88` 时会上溢为 inf，因此必须先减去行内最大值再算指数，数学上等价但数值稳定。
 
 ---
 
 ## 性能总览
 
->默认测试配置：FP32，序列长度 N = 8192（Batch=8 × Tokens=1024），通道数 C = 768，block size = 128
+> 默认测试配置：FP32，`B=8, T=1024`（`N=8192`），`C=50257`（模拟 GPT-2 输出层），主要分析配置 `block_size=512`。设备：RTX 5060 Laptop。
+> v3 固定 `block_size=32`（单 Warp），其余版本在 32~1024 间扫参。
 
->测试基准全仓库环境统一，详见根目录 README
+![全 block size 耗时矩阵](images/softmax_overview_table.png)
 
-![全尺寸性能对比](images/layernorm.png)
+### Block Size = 512 下的硬件指标
 
-| 版本 | 核心实现 | 耗时 (ms) | Compute (%) | Memory (%) | 寄存器 |
-|:---:|---|:---:|:---:|:---:|:---:|
-| v1 | CPU 朴素移植，1 线程处理 1 行 | 1.00 | 5.83 | 63.58 | 40 |
-| v2 | 三 Kernel 拆分，Block 级共享内存规约 | 0.34 | — | — | — |
-| v3 | Warp 级两趟法，shuffle 规约 | 0.12 | 57.09 | 74.53 | 26 |
-| v4 | Warp 级单趟法，Var(x)=E[x²]−E[x]² | 0.12 | 47.26 | 75.74 | 24 |
-| v5 | Block 级两级规约，适配大 C | 0.15 | 62.98 | 69.05 | 22 |
-| v6 | 共享内存 + 128bit 向量化 | **0.11** | 26.08 | **83.39** | 42 |
+![NCU 512 尺寸实测](images/softmax_512_ncu.png)
 
-> v2 耗时为三个 Kernel 之和：mean 0.08 + rstd 0.09 + norm 0.17 = 0.34 ms。
+| 版本 | 核心实现 | 耗时 (ms) | Compute (%) | Memory (%) | 寄存器 | Grid Size |
+|:---:|---|:---:|:---:|:---:|:---:|:---:|
+| v1 | 单线程一行，三趟朴素 | 105.91 | 9.58 | 45.84 | 40 | 16 |
+| v2 | 1 Block 一行，共享内存二分规约 | 11.52 | 36.39 | 78.16 | 28 | 8192 |
+| v3 | 1 Warp 一行，纯 Shuffle 规约 | 44.93 | 8.49 | 57.09 | 16 | 8192 |
+| v4 | 两级规约（Warp Shuffle + 跨 Warp 共享内存） | 14.35 | 27.28 | 60.66 | 22 | 8192 |
+| v5 | 两级规约 + 循环展开 + 计算合并 + 流式访存 | **10.56** | 36.26 | **85.06** | 40 | 8192 |
+| v6 | 在线 Softmax，单线程一行 | 141.65 | 53.74 | 20.82 | 33 | 16 |
+| v7 | 在线 Softmax + 协作组，1 Warp 一行 | 15.20 | 16.62 | 84.59 | 22 | 512 |
+| v8 | 在线 Softmax + 无分支 Shuffle | 15.22 | 12.56 | 84.43 | 21 | 512 |
+| v9 | 在线 Softmax + 块级两级规约 | 10.86 | 26.44 | 80.09 | 18 | 8192 |
 
-**从 v1 到 v6，性能提升约 9 倍。** 下方逐版本拆解优化历程。
+> **从 v1 到 v5，耗时从 105.91ms 降至 10.56ms，提升约 10 倍。**
+> 全局最优为 v5@512（10.56ms）；在线算法 v9@512（10.86ms）以更少访存量追平标准三趟法。
 
 ---
 
-## v1 — 朴素移植：CPU 逻辑直接搬上 GPU
+## v1 — 朴素移植：单线程处理一行
 
-最直观的写法：在 B、T 维度并行，一个 GPU 线程负责一个 token，通道维度 C 仍然串行遍历。
+最直接的 CPU 移植：每个线程独立处理一行 `C` 个元素，串行完成三趟遍历。
 
 ```cuda
-__global__ void layernorm_forward_kernel1(float* out, float* mean, float* rstd,
-    const float* inp, const float* weight, const float* bias, int N, int C) {
-
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N) return;
-
-    const float* x = inp + idx * C;
-
-    // 三趟串行循环：均值 → 方差 → 归一化
-    // 第一趟：求均值
-    float m = 0.0f;
-    for (int i = 0; i < C; i++) m += x[i];
-    m /= C;
-
-    // 第二趟：求方差
-    float v = 0.0f;
-    for (int i = 0; i < C; i++) {
-        float d = x[i] - m;
-        v += d * d;
+__global__ void softmax_forward_kernel1(float* out, const float* inp, int N, int C) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {
+        const float* inp_row = inp + i * C;
+        float* out_row = out + i * C;
+        // 三趟串行循环：最大值 → 指数求和 → 归一化
+        ...
     }
-    v /= C;
-    float s = rsqrtf(v + 1e-5f);
-
-    // 第三趟：归一化
-    float* o = out + idx * C;
-    for (int i = 0; i < C; i++) {
-        o[i] = s * (x[i] - m) * weight[i] + bias[i];
-    }
-    mean[idx] = m;
-    rstd[idx] = s;
 }
 ```
 
 ### 问题
+1. **并行度严重不足**：只有 `N=8192` 个线程，block=512 时 Grid 仅 16，26 个 SM 一半以上空闲（NCU 实测 Memory Throughput 仅 45.84%）。
+2. **访存不合并**：相邻线程处理的行地址间隔 `C=50257` 个元素，Warp 内 32 个线程访问完全不连续的地址，每个 32 字节 Cache Line 只用到 4 字节，带宽利用率极低。
+3. **长串行依赖**：单线程串行跑 5 万次循环，延迟无法被其他 Warp 隐藏。
 
-- **一个线程串行跑 C=768 次循环**，GPU 上有几千个 CUDA Core，但每个线程是串行的，算力严重浪费。
-- **读 input 三次**（均值、方差、归一化各一趟），访存效率低。
-- Compute Throughput 只有 5.83%——几乎没用到算力，纯粹被串行循环卡住了。
+> v1@1024 时 Grid 进一步缩小到 8，耗时暴涨至 247.26ms——这不是算法退化，而是 SM 完全欠载。
 
 <br>
 
 ---
 
-## v2 — 三 Kernel 拆分
+## v2 — 1 Block 一行：共享内存二分规约
 
-v1 的问题是通道维度 C 完全串行。v2 把 C 维度也并行化，将 LayerNorm 的均值计算、方差计算、归一化操作分别拆分为三个独立的 Kernel：
+v1 的问题是并行度和访存合并。v2 改为**一个 Block 处理一行**，块内所有线程协作分摊 `C` 个元素：
 
-1. **`mean_kernel`**：1 个 Block 处理 1 行，Block 内多线程分摊 C 个元素，用**共享内存二分规约**求均值。
-2. **`rstd_kernel`**：同理求方差倒数。
-3. **`normalization_kernel`**：展开成并行——每个线程处理 1 个输出元素。
+- 相邻线程访问连续地址（thread 0 读 `x[0]`、thread 1 读 `x[1]`……），**恢复合并访存**。
+- 块内规约用经典的共享内存二分规约（每轮 stride 折半），需要多次 `__syncthreads()`。
 
 ```cuda
-// 分块一：算均值（Block 级共享内存二分规约）
-__global__ void mean_kernel(float* mean, const float* inp, int N, int C, int block_size) {
+__global__ void softmax_forward_kernel2(...) {
     extern __shared__ float shared[];
-    int idx = blockIdx.x;
+    int bid = blockIdx.x;
     int tid = threadIdx.x;
-    const float* x = inp + idx * C;
-
-    // 线程粗化：block 内 block_size 个线程分摊 C 个元素
-    float sum = 0.0f;
-    for (int i = tid; i < C; i += block_size) sum += x[i];
-    shared[tid] = sum;
+    const float* x = inp + bid * C;
+    // 线程粗化遍历求局部最大值
+    float maxval = -INFINITY;
+    for (int i = tid; i < C; i += blockDim.x)
+        maxval = fmaxf(maxval, x[i]);
+    // 共享内存二分规约
+    shared[tid] = maxval;
     __syncthreads();
-
-    // 二分规约：步长折半，每轮同步
-    for (int stride = block_size / 2; stride >= 1; stride /= 2) {
+    for (int stride = blockDim.x / 2; stride >= 1; stride /= 2) {
+        if (tid < stride) shared[tid] = fmaxf(shared[tid], shared[tid + stride]);
         __syncthreads();
-        if (tid < stride) shared[tid] += shared[tid + stride];
     }
-    if (tid == 0) mean[idx] = shared[0] / C;
-}
-
-// 分块二：算倒标准差（结构和 mean_kernel 完全一致，只是累加内容不同）
-__global__ void rstd_kernel(float* rstd, const float* inp, const float* mean, int N, int C, int block_size) {
-    // ... 与 mean_kernel 完全相同的规约结构 ...
-    // 中间结果 mean[idx] 从全局内存读回
-    // 区别仅在于：sum += (x[i] - m)^2，最终 rstd[idx] = 1/sqrt(sum/C + eps)
-}
-
-// 分块三：归一化（每个线程处理 1 个输出元素，全并行）
-__global__ void normalization_kernel(float* out, const float* inp, float* mean, float* rstd,
-                                     const float* weight, const float* bias, int B, int T, int C) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int bt = idx / C;      // 属于哪个 token
-    int c  = idx % C;      // 通道下标
-
-    float m = mean[bt];    // 查分块一的结果
-    float s = rstd[bt];    // 查分块二的结果
-    out[idx] = s * (inp[idx] - m) * weight[c] + bias[c];
-}
-
-// 三个 Kernel 在主函数中串行调用：
-mean_kernel<<<N, block_size, block_size * sizeof(float)>>>(mean, inp, N, C, block_size);
-rstd_kernel<<<N, block_size, block_size * sizeof(float)>>>(rstd, inp, mean, N, C, block_size);
-normalization_kernel<<<grid_norm, 256>>>(out, inp, mean, rstd, weight, bias, B, T, C);
-```
-
-### 提升与问题
-
-**提升**：C 维度并行起来了，耗时从 1.00ms 降到 0.34ms。
-
-**问题**：
-1. **三个 Kernel 串行启动**，有多次启动开销。
-2. **中间结果 mean/rstd 写回全局内存**，下一个 Kernel 再读回来——多了两次不必要的全局访存。
-3. Block 级规约需要**共享内存 + `__syncthreads()`**，跨 Warp 通信开销大。
-
-> 观察 mean_kernel 和 rstd_kernel 的 Memory Throughput 都达到了 ~84%，说明纯访存操作本身已经很高效。瓶颈不在带宽，而在**Kernel 拆分带来的额外全局读写和同步**。
-
-<br>
-
----
-
-## v3 — Warp 级并行：去掉共享内存和中间写回
-
-v2 的核心痛点是"跨 Warp 通信必须走共享内存"。那如果**一个 Warp（32 线程）独立处理一整行**呢？
-
-- **任务划分**：1 个 Warp = 1 个 Token，32 个线程分摊 C=768 个元素。
-- **规约方式**：Warp 内 32 线程通信走**硬件 shuffle 指令**（`__shfl_down_sync`），直接互读寄存器，不需要共享内存，不需要 `__syncthreads()`。
-- **单 Kernel 完成全部计算**：均值、方差、归一化在同一个 Kernel 里完成，中间结果留在寄存器，不写回全局内存。
-- **流式访存**：输入读一次就不再用，用 `__ldcs` 绕过缓存，给 weight/bias 留出缓存空间。
-
-```cuda
-__global__ void layernorm_forward_kernel3(
-    float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
-    const float* __restrict__ inp, const float* __restrict__ weight,
-    const float* __restrict__ bias, int N, int C) {
-
-    namespace cg = cooperative_groups;
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-
-    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
-    if (idx >= N) return;
-    const float* x = inp + idx * C;
-
-    // ── 第一趟：算均值 ──
-    float sum = 0.0f;
-    for (int i = warp.thread_rank(); i < C; i += warp.size()) sum += x[i];
-    sum = cg::reduce(warp, sum, cg::plus<float>{});  // shuffle 规约，无共享内存
-    float m = sum / C;
-
-    // ── 第二趟：算方差──
-    sum = 0.0f;
-    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
-        float d = x[i] - m;
-        sum += d * d;
-    }
-    sum = cg::reduce(warp, sum, cg::plus<float>{});
-    float s = rsqrtf(sum / C + 1e-5f);  // 硬件原生指令
-
-    // ── 第三趟：归一化 + 仿射变换 ──
-    float* o = out + idx * C;
-    for (int c = warp.thread_rank(); c < C; c += warp.size()) {
-        float n = s * (__ldcs(x + c) - m);
-        __stcs(o + c, n * weight[c] + bias[c]);
-    }
+    ...
 }
 ```
-
-### 为什么快？
-
-| 对比项 | v2 (Block 级) | v3 (Warp 级) |
-|---|---|---|
-| 规约通信 | 共享内存读写 + `__syncthreads()` | shuffle 指令，寄存器直读 |
-| 中间结果 | mean/rstd 写回 DRAM 再读回 | 留在寄存器，零全局访存 |
-| Kernel 数量 | 3 个 | 1 个 |
-| 耗时 | 0.34 ms | **0.12 ms** |
-
-Warp 级规约的延迟只有几个时钟周期（shuffle 是硬件指令），而 Block 级共享内存规约需要多次 `__syncthreads()`，延迟高一个数量级。
-
-<br>
-
----
-
-## v4 — 单趟法：理论上更快，然而...
-
-v3 读了 input 两次（第一趟算均值，第二趟算方差）。数学上有个公式：
-
-```
-Var(x) = E[x²] - E[x]²
-```
-
-这样一次遍历就能同时累加 `sum(x)` 和 `sum(x²)`，省掉第二趟读 input。
-
-```cuda
-// v4 核心：一次循环同时累加 sum 和 sum2
-float sum = 0.0f, sum2 = 0.0f;
-for (int i = warp.thread_rank(); i < C; i += warp.size()) {
-    float xi = x[i];
-    sum += xi;
-    sum2 += xi * xi;
-}
-sum  = cg::reduce(warp, sum, cg::plus<float>{});
-sum2 = cg::reduce(warp, sum2, cg::plus<float>{});
-float m = sum / C;
-float var = sum2 / C - m * m;  // 套公式
-float s = rsqrtf(var + 1e-5f);
-```
-
-### 实测：和 v3 一样快（0.12ms），为什么？
-
-理论上少读一次 input 应该更快，但数据打平了。这里列出二个原因（**详细评测过程放在末尾**）：
-
-1. **L2 缓存吃掉了收益**：v3 第二趟读 input 时，数据还在 L2 里（整个 input 约 25MB，RTX 5060 的 L2 缓存足够大），根本没去读 DRAM。v4 省下的那次 L2 读取，收益微乎其微。
-2. **计算依赖链变长**：同时累加 sum 和 sum2，指令并行度下降，Compute Throughput 从 57.09% 降到 47.26%。
-
-**单趟法公式的代价：数值稳定性差**
-
-当输入数值大但方差小时（比如所有值都是 10000.1），`E[x²]` 和 `E[x]²` 都是上亿的大数，两个大数相减会丢精度，甚至算出负方差导致 NaN。
-
-> **选型判断**：训练用 v3（两趟法数值稳定）；推理可以用 v4（推理对精度损失不敏感，效率优先）。
-
-<br>
-
----
-
-## v5 — Block 级两级规约：解决大通道数问题
-
-v3 的局限：1 个 Warp 处理 1 行，只有 32 个线程，当 C 很大时，每个线程要循环很多次，并行度不够。
-
-v5 回到 Block 级：1 个 Block 处理 1 行，用更多线程分摊。同时使用**两级规约**，也不像 v2 那样纯走共享内存。
-
-```
-两级规约流程：
-每个线程先算局部 sum
-    → Warp 内 shuffle 规约（32 线程一组，走寄存器）
-    → 各 Warp 的结果写入共享内存（只写 num_warps 个 float）
-    → 每个 Warp 从共享内存读回所有 Warp 的结果
-    → 再做一次 Warp 内 shuffle 规约
-    → 得到整个 Block 的总和
-```
-
-```cuda
-// 第一级：Warp 内 shuffle 规约
-float warp_sum = cg::reduce(warp, thread_sum, cg::plus<float>{});
-
-// 跨 Warp：只写一次共享内存
-shared_sum[warp_id] = warp_sum;
-__syncthreads();
-
-// 第二级：从共享内存读回，再做一次 Warp 规约
-warp_sum = (lane_id < num_warps) ? shared_sum[lane_id] : 0.0f;
-float block_sum = cg::reduce(warp, warp_sum, cg::plus<float>{});
-```
-
-### 为什么 C=768 时 v5 反而比 v3 慢？（0.15 vs 0.12）
-
-v5 在 C=768 时不是最优，原因：
-
-1. **C=768 不大**：32 个线程每个循环 24 次，已经足够并行，Block 级的优势体现不出来。
-2. **多了 `__syncthreads()` 同步开销**：Warp 之间要等齐。
-
-### 附上 C=4096 时的测试结果，此时 v5 超越了 v3（0.88 vs 1.01）
-
-![全尺寸性能对比](images/layernorm5.png)
-
-**结论**：C 很小时 Warp 级并行更优；C 很大时 Block 级并行更优，C 越大优势越明显。
-
->warp 级和 block 级各有不可替代的优势区间，实际工程中需根据 C 的大小自适应选择最优版本。详见 fused README
-
-<br>
-
----
-
-## v6 — 共享内存 + 128bit 向量化
-
-v3 已经很快了，但还有两个浪费：
-1. input 读了两次（均值一趟、方差一趟），就算 L2 命中也仍是开销。
-2. weight/bias 每个 Warp 都要从全局内存读一次。
-
-v6 的解法：
-
-- **128bit 向量化访存**：一次加载 4 个 float（`float4` / `x128`），访存指令数减少到 1/4。
-- **全部装进共享内存**：把 weight、bias、input 全部缓存到共享内存，后续两趟遍历都走共享内存，不再碰全局内存。
-- **2D Block 设计**：`<<<grid, (32, block_y)>>>`，一个 Block 里多个 Warp 共享 weight/bias——全 Block 合力加载一次，后续共用。
-
-```cuda
-__global__ void layernorm_forward_kernel6(...) {
-    extern __shared__ char params[];
-    int packs = C / x128::size; // 每行数据需要的 x128 包的数量
-    x128* s_weight = reinterpret_cast<x128*>(params);
-    x128* s_bias   = s_weight + packs;
-    x128* s_inp    = s_weight + (2 + threadIdx.y) * packs;
-
-    // 全 Block 合力加载 weight/bias（只读一次 DRAM）
-    int tidx = threadIdx.y * WARP_SIZE + threadIdx.x;
-    for (int p = tidx; p < packs; p += blockDim.y * WARP_SIZE) {
-        s_weight[p] = load128(weight + p * x128::size);
-        s_bias[p]   = load128(bias   + p * x128::size);
-    }
-    __syncthreads();
-
-    // 第一趟：向量化加载 input，算均值 + 顺手缓存到共享内存
-    for (int p = threadIdx.x; p < packs; p += WARP_SIZE) {
-        x128 in_data = load128cs(inp + p * x128::size);
-        for (int k = 0; k < 4; k++) sum += (float)in_data[k];
-        s_inp[p] = in_data;  // 第二趟算方差直接从共享内存读
-    }
-    float m = warpReduceSum(sum) / C;
-
-    // 第二趟：从共享内存读 input 算方差（不碰 DRAM）
-    for (int p = threadIdx.x; p < packs; p += WARP_SIZE) {
-        x128 in_data = s_inp[p];
-        for (int k = 0; k < 4; k++) { float d = (float)in_data[k] - m; v += d * d; }
-    }
-    float s = rsqrtf(v / C + eps);
-
-    // 第三趟：全从共享内存读，向量化写回 DRAM
-    for (int p = threadIdx.x; p < packs; p += WARP_SIZE) {
-        x128 in_data = s_inp[p], w = s_weight[p], b = s_bias[p];
-        x128 out_data;
-        for (int k = 0; k < 4; k++)
-            out_data[k] = (s * ((float)in_data[k] - m)) * (float)w[k] + (float)b[k];
-        store128cs(out + p * 4, out_data);
-    }
-}
-```
-
-### 共享内存用量
-
-C=768, block_y=4（一个 Block 4 个 Warp）：
-
-| 区域 | 包数 (1包=16字节) | 大小 |
-|---|---|---|
-| weight | 768/4 = 192 | 3 KB |
-| bias | 192 | 3 KB |
-| input 缓存 | 4 × 192 = 768 | 12 KB |
-| **合计** | 1152 | **18 KB** |
-
-> 当前配置下 18KB < 48KB 默认上限，不需要 `cudaFuncSetAttribute`。当 C 更大时，共享内存可能超过 48KB，代码会通过 `cudaFuncSetAttribute` 手动申请，失败时自动回退到 v5。
 
 ### 效果
+- 耗时从 v1 的 105.91ms 降到 **11.52ms**——9 倍提升，合并访存恢复后带宽利用率从 45.84% 升到 78.16%。
+- Memory Throughput 78.16%——还有提升空间。
 
-- Memory Throughput 从 v3 的 74.53% 提升到 **83.39%**——靠近 GPU 显存带宽物理上限。
-- Compute Throughput 降到 26.08%——瓶颈已从计算侧转移到访存侧
-- 寄存器 42 个，比 v3 的 26 个多，但访存收益远大于寄存器占用带来的 Occupancy 损失。
->关于 Occupancy 对访存受限型算子的影响度，可见我在同仓库 residual 目录中 README 的描述
+### 现存问题
+1. **共享内存规约开销大**：每个线程都写共享内存（block_size 个 float），多次块级同步。
+2. **第三趟重新读 exp 结果**：求 sum 时要把刚写回全局内存的 `out` 再读一遍，多一次全局往返。
 
----
-
-### 优化路径总结
-
-```
-v1 (1.00ms)  朴素移植，串行循环，算力浪费
-  ↓ 把 C 维度并行化
-v2 (0.34ms)  三 Kernel 拆分，Block 级共享内存规约
-  ↓ 去掉跨 Warp 通信和中间写回
-v3 (0.12ms)  Warp 级 shuffle 规约，单 Kernel 完成
-  ↓ 尝试减少访存
-v4 (0.12ms)  单趟法 E[x²]−E[x]²，L2 缓存吃掉了收益
-  ↓ 适配大通道数
-v5 (0.15ms)  Block 级两级规约，C=768 时反而慢
-  ↓ 向量化 + 共享内存缓存
-v6 (0.11ms)  128bit 访存 + 共享内存复用，打满带宽
-```
-
-### 规律总结
-
-1. **规约计算的层级越低越快**：Warp shuffle（寄存器）> Block 共享内存 > 全局内存。
-2. **能在单 Kernel 里融合就别拆**：中间结果写回再读回的代价，往往大于并行化的收益。
-3. **访存受限算子的终极优化是减少 DRAM 访问次数**：v6 把 input 从读 2 次 DRAM 变成读 1 次，weight/bias 从每个 Warp 读一次变成全 Block 读一次。
-4. **实测数据比理论分析重要**：v4 理论上少一趟访存应该更快，但实测没有超过v3——benchmark 才是真理。
-
-<br>
-
-### 后续优化方向: 见同仓库下 fused 目录的 README 文档
-
-<br>
 <br>
 
 ---
 
-## 为什么 v4 相比 v3 没有提速？NCU 实测数据
+## v3 — 单 Warp 一行：纯 Shuffle 规约
 
-理论上 v4 少读一次 input 应该更快，但在C=768的实测中 v3 和 v4 耗时都是 0.12ms。
-用 NCU 逐层拆解访存链路，原因展示：
+v2 的共享内存二分规约有同步开销。v3 把任务划分缩小到**一个 Warp（32 线程）处理一行**，全程用 `__shfl_down_sync` 完成 Warp 内规约，不碰共享内存。
 
-#### 第一层：L1 Cache
+```cuda
+__global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int C) {
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;       // 固定 blockDim.x = 32
+    const float* x = inp + bid * C;
+    // Warp 内跨步遍历，shuffle 规约求最大值
+    float maxval = -INFINITY;
+    for (int i = tid; i < C; i += 32)
+        maxval = fmaxf(maxval, x[i]);
+    maxval = warpReduceMax(maxval);
+    float offset = __shfl_sync(0xFFFFFFFF, maxval, 0);  // 广播给所有线程
+    ...
+}
+```
 
-**v3（两趟法）**——L1 发出 120 MB load 请求：
+### 为什么 v3 在大 C 下反而慢？
+v3 固定 block=32，一个 Warp 处理一行 `C=50257`，每个线程要串行循环约 1570 次。虽然无共享内存、无块级同步，但：
+- **并行度不足**：一个 Block 只有 32 线程，SM 上每个 Block 占用的 Warp 数太少，无法填满 SM 的 warp slot，延迟隐藏能力弱。
+- NCU 实测 Memory Throughput 仅 57.09%，Compute 8.49%——大量时间花在长循环的串行依赖上。
 
-![v3 L1 Cache](images/layernorm1.png)
+> v3 适合小 C（如 C=768，32 个线程循环 24 次就结束），延迟优势明显；但在 C=50257 的词表维度下，并行度成为瓶颈。
 
-**v4（单趟法）**——L1 只发出 96 MB load 请求：
+<br>
 
-![v4 L1 Cache](images/layernorm2.png)
+---
 
-v3 确实多读了一趟（983,040 vs 786,432 条 load 指令，差 24 MB）。
-问题是：这 24 MB 走到 DRAM 了吗？
+## v4 — 两级规约：Warp Shuffle + 跨 Warp 共享内存
 
-#### 第二层：L2 Cache → DRAM
+v4 结合 v2 和 v3 的优点，采用**两级规约架构**：
 
-**v3（两趟法）**：
+- **第一级（Warp 内）**：32 线程用 Shuffle 指令在寄存器内完成规约，延迟极低。
+- **第二级（跨 Warp）**：每个 Warp 的 lane 0 把结果写入共享内存，由 Block 主线程串行合并。
 
-![v3 L2 + DRAM](images/layernorm3.png)
+```
+Block 内 N 个 Warp
+  ├── Warp 0：32 线程 shuffle 规约 → 结果写 shared[0]
+  ├── Warp 1：32 线程 shuffle 规约 → 结果写 shared[1]
+  ├── ...
+  └── Warp k：32 线程 shuffle 规约 → 结果写 shared[k]
+         ↓
+  Block 主线程：串行合并 shared[0..k] → 广播全局结果
+```
 
-**v4（单趟法）**：
+### 共享内存用量对比
+| | v2（共享内存二分） | v4（两级规约） |
+|---|---|---|
+| 共享内存 | block_size 个 float | warpsPerBlock 个 float |
+| block=1024 时 | 1024 × 4B = 4 KB | 32 × 4B = 128 B |
 
-![v4 L2 + DRAM](images/layernorm4.png)
+共享内存占用大幅降低，SM 可驻留更多 Block。
 
-关键数据对比：
+### 效果与问题
+- 耗时 14.35ms，比 v2 的 11.52ms 略慢。原因是 v4 多了跨 Warp 串行合并的 `__syncthreads()` 开销，且仍保留"重新读 exp 结果求 sum"的额外全局内存往返。
+- Memory Throughput 60.66%——v5 会针对这两点优化。
 
-| 层级 | 指标 | v3（两趟法） | v4（单趟法） | 差异说明 |
-|---|---|---|---|---|
-| **L1** | Global Load Sectors | 3,932,160 | 3,145,728 | v3 多读 786,432 sectors（多一趟 input） |
-| **L1** | → Miss 到 L2 Sectors | 1,633,144 | 1,256,888 | v3 多发 376,256 到 L2 |
-| **L2** | 收到的 Load Sectors | 1,633,480 | 1,261,004 | v3 多收 372,476，量级一致 |
-| **L2** | Hit Rate | 51.45% | 37.60% | v3 命中率高 13.85% |
-| **L2** | → Miss 到 DRAM Sectors | 786,624 | 786,624 | **完全一样！** |
-| **DRAM** | 实际 Load Bytes | 24 MB | 24 MB | **完全一样！** |
+<br>
 
-1. v3 在 L1 多读了 786,432 sectors（第二趟算方差）
-2. 其中约一半命中 L1，另一半约 37.6 万 sectors 发到了 L2
-3. v3 在 L2 的命中率（51.45%）比 v4（37.60%）高 13.85%，把多发的这部分在 L2 接住了
-4. 最终两者漏到 DRAM 的都是 786,624 sectors = 24 MB，一字节都没多
+---
 
-#### 结论
+## v5 — 高性能版：循环展开 + 计算合并 + 流式访存
 
-这个算子是访存受限的，瓶颈在 DRAM 带宽（两者都跑到了 ~75%）。
-v4 省掉的那趟遍历省的是 L2 读取，不是 DRAM 读取，对最终性能影响微乎其微。
-同时 v4 因为同时累加 sum 和 sum2，计算依赖链变长，LSU 省下的时间被计算补回，总耗时相当。
+v5 在 v4 的两级规约基础上做了 6 项关键优化：
+
+1. **8 倍循环展开**：`UNROLL_FACTOR=8`，减少循环控制指令，批量发射访存请求，用计算时间隐藏访存延迟。
+2. **计算合并（省一趟全局读）**：计算 exp 写回的同时，在寄存器内直接累加局部 sum，不再需要把 exp 结果写回全局内存后再读回来求 sum。
+3. **共享内存分区**：`maxvals` / `sumvals` 独立两段，逻辑清晰。
+4. **流式访存**：`__ldcs` 加载输入，输入和输出只读一次，不污染 L2 缓存。
+5. **边界处理**：读操作用 `min(C-1, idx)` 钳位（重复读不影响 max/sum 结果），写操作严格 `if (idx < C)` 判断（越界写会破坏其他行）。
+6. **读写分离**：先批量加载到寄存器、再集中计算写回，让编译器有充足的指令调度空间。
+
+```cuda
+// 第二趟：计算 exp + 写回 + 寄存器内局部求和（三合一）
+float sumval = 0.0f;
+for (int i = tid; i < C; i += blockDim.x * 8) {
+    float reg_array[8];
+    // 阶段 1：批量加载到寄存器
+    #pragma unroll
+    for (int u = 0; u < 8; u++)
+        reg_array[u] = __ldcs(&x[min(C-1, i + u * blockDim.x)]);
+    // 阶段 2：批量计算、写回、寄存器内累加
+    #pragma unroll
+    for (int u = 0; u < 8; u++) {
+        if (i + u * blockDim.x < C) {
+            float output = expf(reg_array[u] - offset);
+            y[i + u * blockDim.x] = output;
+            sumval += output;   // 省掉一趟全局内存读
+        }
+    }
+}
+```
+
+### 效果
+- 耗时 **10.56ms**，全局最优。
+- Memory Throughput **85.06%**——接近 DRAM 带宽上限，算子已被带宽吃满。
+- Compute Throughput 36.26%——剩余算力空转是访存受限算子的正常表现。
+
+<br>
+
+---
+
+## v6 — 在线 Softmax 朴素移植
+
+前面 v1~v5 都是标准三趟法，需要把 exp 中间结果写回全局内存再读回来求 sum。v6 引入**在线 Softmax**（Online Softmax，基于论文《Online normalizer calculation for softmax》），将"求最大值"和"求指数和"合并到一次遍历中：
+
+```
+遍历每个元素 x：
+  if x > 当前 maxval:
+      maxval = x
+      sum = sum * exp(旧max - 新max) + exp(x - 新max)   # 旧 sum 折算到新基准
+  else:
+      sum = sum + exp(x - maxval)
+```
+
+数学等价性：全程只有加法和乘法，没有大数相消误差。相比三趟法，访存从 3 次降为 2 次（1 读输入 + 1 写输出）。
+
+### 为什么 v6 这么慢？
+v6 仍是"单线程处理一行"的并行模式，问题和 v1 完全一样：
+- block=512 时 Grid 仅 16，SM 严重欠载。
+- Memory Throughput 仅 20.82%——不是在线算法慢，是并行度不足导致数据喂不进去。
+- Compute Throughput 反而有 53.74%（单线程串行算 exp，计算单元在忙但带宽没吃满）。
+
+> v6 的存在价值是作为在线算法的基线，证明"在线算法本身不是银弹，必须配合正确的并行策略"。
+
+<br>
+
+---
+
+## v7 — 在线 Softmax + 协作组：1 Warp 一行
+
+v6 的问题是单线程并行度不足。v7 改为**一个 Warp 处理一行**，用 `cooperative_groups` 做 Warp 级规约。
+
+核心数据结构 `SumMax` 把"局部最大值"和"基于该最大值的指数和"打包成 8 字节对齐结构体，通过 shuffle 一次性交换：
+
+```cuda
+struct __align__(8) SumMax { float maxval; float sum; };
+
+__device__ SumMax reduce_sum_max_op(SumMax a, SumMax b) {
+    // 选更大的 max 作为基准，较小基准下的 sum 折算过来
+    float bigger = fmaxf(a.maxval, b.maxval);
+    float sum = (a.maxval == bigger ? a.sum : a.sum * expf(a.maxval - bigger))
+              + (b.maxval == bigger ? b.sum : b.sum * expf(b.maxval - bigger));
+    return {bigger, sum};
+}
+```
+
+```cuda
+__global__ void online_softmax_forward_kernel7(...) {
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    int row = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    const float* x = inp + row * C;
+    SumMax sm_partial = {-INFINITY, 0.0f};
+    // Warp 内跨步遍历，逐元素合并到局部 SumMax
+    for (int i = warp.thread_rank(); i < C; i += 32)
+        sm_partial = reduce_sum_max_op(sm_partial, {x[i], 1.0f});
+    // Warp 内规约
+    SumMax sm_total = cg::reduce(warp, sm_partial, reduce_sum_max_op);
+    // 归一化写回
+    for (int i = warp.thread_rank(); i < C; i += 32)
+        out[row * C + i] = expf(x[i] - sm_total.maxval) / sm_total.sum;
+}
+```
+
+### 效果
+- 耗时 15.20ms，Memory Throughput 84.59%——带宽利用率很高。
+- **但比 v5（10.56ms）慢了 44%**，尽管 Memory Throughput 几乎相同。
+
+### 为什么 Memory 高却更慢？
+关键在 **Grid Size**：
+- v5：Grid = 8192（一个 Block 处理一行，512 线程并行）
+- v7：Grid = 512（一个 Block 内 16 个 Warp 各处理一行）
+
+v7 的 Block 总数只有 v5 的 1/16，SM 上驻留的 Block 数不足，虽然"有数据传输时带宽利用率高"，但部分 SM 在空转，总数据搬运时间更长。**Memory Throughput 百分比不是唯一指标，Grid Size 是否填满 SM 同样关键。**
+
+<br>
+
+---
+
+## v8 — 在线 Softmax + 无分支 Shuffle
+
+v8 用 `fmaxf` + 统一公式抹掉 v6/v7 中的 if-else 分支：
+
+```cuda
+float maxval = -INFINITY, sumval = 0.0f, bigger;
+for (int i = laneId; i < C; i += 32) {
+    bigger = fmaxf(maxval, x[i]);
+    sumval = sumval * expf(maxval - bigger) + expf(x[i] - bigger);
+    maxval = bigger;
+}
+```
+
+所有线程执行完全相同的指令，无分支发散。
+
+### 实测：v8 没有比 v7 更快
+v8 耗时 15.22ms，与 v7 的 15.20ms 差异在测量噪声内，**性能基本一致**。原因：
+1. 本算子是访存受限，ALU 上多算一次 exp 被访存延迟完全隐藏。
+2. 在线 Softmax 的 max 刷新天然稀疏（一行 5 万元素里真正刷新最大值的次数极少），if-else 分支高度可预测，发散开销本就很小。
+
+> v8 的价值不是性能提升，而是验证了"无分支优化的适用边界"——它在计算密集 + 分支随机的场景才值钱，在访存密集 + 分支可预测的场景里就是被隐藏的多余运算。
+
+<br>
+
+---
+
+## v9 — 在线 Softmax + 块级两级规约
+
+v9 把在线合并算子 `reduce_sum_max_op` 嫁接到 v4 的块级两级规约架构上：一个 Block（512 线程）处理一行，Warp 内 shuffle 规约 SumMax，跨 Warp 通过共享内存合并。
+
+```
+每线程遍历自己负责的元素 → 累积局部 SumMax
+  ↓ Warp 内 shuffle 规约（合并 32 个 SumMax）
+各 Warp lane 0 写 shared_sm[warpId]
+  ↓ Block 主线程串行合并所有 Warp 的 SumMax
+广播全局 maxval / sum → 各线程归一化写回
+```
+
+共享内存仅需 `warpsPerBlock × sizeof(SumMax)` = 16 × 8B = 128 B，远小于 v2 的 2 KB。
+
+### 效果
+- 耗时 **10.86ms**，Memory Throughput 80.09%。
+- **在线算法以 2 趟访存（1 读 1 写）追平了 v5 三趟法的 10.56ms**，差距仅 2.8%。
+
+这验证了在线 Softmax 的工程价值：在大 C（词表维度）场景下，减少一次全局内存往返的收益，被块级并行充分发挥，最终性能逼近甚至超过标准三趟法。
+
+<br>
+
+---
+
+## 优化路径总结
+
+```
+v1 (105.91ms)  单线程一行三趟，并行度不足 + 访存不合并
+  ↓ 1 Block 一行，恢复合并访存
+v2 (11.52ms)   共享内存二分规约 → 带宽利用率升至 78%
+  ↓ 引入两级规约
+v4 (14.35ms)   Warp Shuffle + 跨 Warp 共享内存，减少共享内存占用
+  ↓ 循环展开 + 计算合并 + 流式访存
+v5 (10.56ms)   Memory Throughput 85%，全局最优
+  ↓ 在线 Softmax 减少访存趟数
+v6 (141.65ms)  在线朴素版，单线程并行度不足 → 反而最慢
+  ↓ 1 Warp 一行
+v7 (15.20ms)   在线 + 协作组，带宽高但 Grid 不足
+  ↓ 无分支优化
+v8 (15.22ms)   无分支写法，实测无收益（访存受限 + 分支可预测）
+  ↓ 块级两级规约
+v9 (10.86ms)   在线 + 块级并行，以 2 趟访存追平三趟法
+```
+
+---
+
+## 规律总结
+
+1. **访存合并是第一优先级**：v1 到 v2 的 9 倍提升，本质是把"线程间地址隔 C 个元素"改成了"相邻线程访问连续地址"。地址连续性比任何算法优化都重要。
+2. **Grid Size 决定 SM 是否被填满**：v1/v6 在 block=512 时 Grid 仅 16，一半 SM 空闲，Memory Throughput 不足 46%；v5/v9 Grid=8192，带宽吃满 80%+。
+3. **Memory Throughput 高 ≠ 一定快**：v7/v8 的 Memory Throughput（84%+）和 v5（85%）几乎相同，但 Grid 只有 512，总耗时多了 44%。带宽利用率百分比要结合 Grid Size / Occupancy 一起看。
+4. **在线 Softmax 的价值依赖并行架构**：v6（单线程）最慢，v9（块级并行）追平最优——减少访存趟数的收益，必须有足够的并行度才能兑现。
+5. **无分支优化有适用边界**：v8 消除了 if-else 分支但没有收益，因为访存受限算子的 ALU 空闲时间足够掩盖多余运算。优化手段要匹配瓶颈类型。
+
+---
+
+## 后续优化方向
+
+1. **Float4 向量化访存**
+   当前 v5/v9 仍是标量加载（4 字节/次），改为 `float4`（16 字节/次）可将访存指令数减至 1/4，进一步压榨带宽利用率。需处理 C 非 4 对齐的边界。
+
+2. **GEMM 尾融合：Linear + Softmax**
+   在语言模型中，Softmax 紧跟在输出层 GEMM 之后。基于 CUTLASS / cuBLAS Lt 自定义 Epilogue，将 Softmax 挂载到 GEMM 输出端，省去 logits 张量的一次 DRAM 往返，是推理框架的标准优化。
+
+3. **在线 + 块级两级规约 + 向量化**
+   v9 已经追平 v5，若再叠加 float4 向量化和循环展开，有望在词表维度下成为真正的最优版本（访存趟数更少 + 带宽利用率更高）。

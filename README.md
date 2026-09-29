@@ -1,9 +1,6 @@
 # Softmax Forward — CUDA 算子优化
 
 从朴素的三趟遍历，到标准块级规约，再到在线 Softmax（Online Softmax），记录 Softmax 在 GPU 上的 9 个版本迭代过程。
-> 本仓库所有性能数据均采集自 Nsight Compute（`ncu --set full --cache-control all`）。NCU 单次采集含硬件计数器采样开销，绝对耗时略高于干净执行，跨版本结论基于同口径下的相对比较与硬件利用率指标。
-
-> 测试基准全仓库环境统一，详见根目录 README
 
 ---
 
@@ -28,12 +25,11 @@ out    = exp(row - maxval) / sum      # 第三趟：归一化写回
 ---
 
 ## 性能总览
+> 本仓库测试基准全环境统一，所有性能数据均采集自 Nsight Compute（`ncu --set full --cache-control all`）。NCU 单次采集含硬件计数器采样开销，绝对耗时略高于干净执行，跨版本结论基于同口径下的相对比较与硬件利用率指标。（硬件等指标详见根目录 README）
 
 > 默认测试配置：FP32，`N=8192`（`B=8 × T=1024`），`C=50257`（模拟 GPT-2 输出层），主要分析配置 `block_size=512`。
 
 > v3 固定 `block_size=32`（单 Warp），其余版本在 32~1024 间扫参。
-
-> 绿底为耗时最少的 block
 
 ![全 block size 耗时矩阵](images/softmax.png)
 

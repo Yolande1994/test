@@ -259,10 +259,12 @@ __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int
 
 ### 设计思路
 
-v2 的共享内存二分规约需要把 block_size 个中间值全部写入共享内存，每轮都同步。v4 沿用 v2 的"一 Block 处理一行"划分，但把规约拆成两级：
+v2 的共享内存二分规约有两个开销：每个线程都要把局部结果写进共享内存（block_size 个 float），每轮 stride 都要 __syncthreads() 块级同步。
 
-- **第一级（Warp 内）**：32 个线程用 Shuffle 指令在寄存器内完成规约，不需要共享内存，也不需要块级同步。
-- **第二级（跨 Warp）**：每个 Warp 的 lane 0 把结果写入共享内存（只需 warpsPerBlock 个 float），由 Block 主线程串行合并。
+v4 沿用 v2 的"1 Block 处理一行"划分，但把规约拆成两级：
+
+- **第一级（Warp 内）**：32 个线程用 Shuffle 指令在寄存器内完成规约，不需要共享内存，也没有块级同步。
+- **第二级（跨 Warp）**：每个 Warp 的 lane 0 把结果写入共享内存（只需 warpsPerBlock 个 float），由 thread 0 读出来合并。
 
 这样共享内存用量从 block_size 个降到 warpsPerBlock 个 float，块级同步次数也从 log2(block_size) 次降到 1 次。
 
@@ -280,10 +282,10 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
     float maxval = -INFINITY;
     for (int i = tid; i < C; i += blockDim.x)
         maxval = fmaxf(maxval, x[i]);
-    maxval = warpReduceMax(maxval);       // 第一级：Warp 内 Shuffle
+    maxval = warpReduceMax(maxval);       // 第一级：Warp 内 Shuffle（5 轮，零共享内存，零块级同步）
     if (laneId == 0) shared[warpId] = maxval;
     __syncthreads();
-    if (tid == 0) {                       // 第二级：0 号线程串行合并
+    if (tid == 0) {                       // 第二级：0 号线程串行合并（只写 16 个值，而非 512 个）
         float val = shared[0];
         for (int i = 1; i < warpsPerBlock; i++)
             val = fmaxf(val, shared[i]);
@@ -297,31 +299,24 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
 }
 ```
 
-### 共享内存用量对比
+### 与 v2 对比
 
-| | v2（共享内存二分） | v4（两级规约） |
+| | v2（共享内存二分规约） | v4（两级规约） |
 |---|---|---|
-| 共享内存 | block_size 个 float | warpsPerBlock 个 float |
-| block=1024 时 | 1024 × 4B = 4 KB | 32 × 4B = 128 B |
+| 共享内存用量 | block_size 个 float | warpsPerBlock 个 float |
+| block=512 时 | 512 × 4B = 2 KB | 16 × 4B = **64 B（省 32 倍）** |
+| Warp 内规约路径 | LDS/STS 共享内存读写 | Shuffle 寄存器通信（延迟更低） |
+| Warp 内规约次数 | 9 轮 | 5 轮 |
+| 跨 Warp 同步次数 | 9 次 `__syncthreads()` | 2 次 `__syncthreads()` |
+| 共享内存 Bank Conflict | 每轮多线程并发写，有冲突 | 只有 lane 0 写，无冲突 |
 
->共享内存占用降低 32 倍，理论上 SM 可驻留更多 Block。
+### 效果
 
-### 效果表现
-
-耗时 14.35ms，比 v2 的 11.52ms **反而慢了**，Memory Throughput 从 78.16% 降到 60.66%。
-
-### 为什么两级规约没有跑赢共享内存二分规约？
-
-v2 和 v4 的宏观任务划分完全一致（1 Block 处理 1 行），差别只在规约机制。理论上两级规约应该更快，但实测反而更慢。原因在于：
-
-1. **v2 的二分规约被编译器深度优化**：当 stride < 32 时，规约只在单个 Warp 内进行，编译器可以直接将其转为寄存器操作（和 Shuffle 等效），实际块级同步次数远低于理论上的 log2(block_size)。
-2. **v4 引入了额外开销**：warpId/laneId 的整数计算、跨 Warp 写共享内存、主线程串行合并——在 C=50257 的大场景下，这些开销相对于 5 万次循环虽然不大，但也无法忽略。
-
-> "两级规约一定更快"是有前提的——需要结合 C 的大小和编译器优化程度判断。在这个测试环境下，v2 的朴素二分规约反而被编译器优化到了极致。
+耗时 14.35ms，反而不如 v2 的 11.52ms，具体的原因分析放在末尾，详见「附录：v4 为什么比 v2 慢」
 
 ### 版本定位
 
-v4 是 v5 的**架构基础**。虽然两级规约本身没有跑赢 v2，但它大幅降低了共享内存占用，为后续 v5 的循环展开和计算合并提供了更干净的骨架。
+v4 是 v2 的算法优化版，是 v5 的架构基础。虽然在我的环境中实测没有跑赢 v2，但它降低了共享内存占用，也为下面的 v5 版提供了干净的骨架。
 
 <br>
 
@@ -329,45 +324,191 @@ v4 是 v5 的**架构基础**。虽然两级规约本身没有跑赢 v2，但它
 
 ## v5 — 高性能版
 
-v5 在 v4 基础上做了 6 项优化：
+### 设计思路
 
-1. **循环展开（UNROLL_FACTOR=8）**：减少循环控制指令，批量发射访存请求，用计算时间隐藏访存延迟。
-2. **计算合并（省一趟全局读）**：计算 exp 写回的同时，在寄存器内直接累加局部 sum，省去一整趟读取 exp 结果的全局内存访问。
-3. **共享内存分区**：`maxvals` / `sumvals` 独立两段，逻辑清晰，无覆盖风险。
-4. **流式访存**：`__ldcs` 加载输入，输入和输出只读一次，不污染缓存。
-5. **边界完善**：读操作用 `min(C-1, idx)` 钳位（重复读不影响 max/sum 结果），写操作严格 `if (idx < C)` 判断（越界写会破坏其他行）。
+v4 还有三个可优化的点：循环控制指令多、exp 结果写了又读、标量访存指令数多。v5 围绕这三点做了 6 项优化：
+
+1. **循环展开**：减少循环控制指令，批量发射访存请求，用计算时间隐藏访存延迟。
+2. **计算合并（省一趟全局读）**：计算 exp 写回的同时，在寄存器内直接累加局部 sum，不再把 exp 结果写回全局内存后再读回来求 sum。
+3. **共享内存分区**：`maxvals`/`sumvals` 独立两段，逻辑清晰，防覆盖。
+4. **流式访存**：`__ldcs` 加载只读一次的输入，避免污染缓存。
+5. **边界处理**：读操作用 `min(C-1, idx)` 钳位（重复读不影响 max/sum 结果），写操作严格 `if (idx < C)` 判断（越界写会破坏其他行）。
 6. **读写分离**：先批量加载到寄存器、再集中计算写回，让编译器有充足的指令调度空间。
 
 ```cuda
-// 第二趟：计算 exp + 写回 + 寄存器内局部求和（三合一）
-float sumval = 0.0f;
-for (int i = tid; i < C; i += blockDim.x * 8) {
-    float reg_array[8];
-    // 阶段 1：批量加载到寄存器
-    #pragma unroll
-    for (int u = 0; u < 8; u++)
-        reg_array[u] = __ldcs(&x[min(C-1, i + u * blockDim.x)]);
-    // 阶段 2：批量计算、写回、寄存器内累加
-    #pragma unroll
-    for (int u = 0; u < 8; u++) {
-        if (i + u * blockDim.x < C) {
-            float output = expf(reg_array[u] - offset);
-            y[i + u * blockDim.x] = output;
-            sumval += output;   // 省掉一趟全局内存读
+__global__ void softmax_forward_kernel5(float* out, const float* inp, int N, int C) {
+    // 优化点3：共享内存分区，max/sum 各一段
+    __shared__ float maxvals[WARPS_PER_BLOCK];
+    __shared__ float sumvals[WARPS_PER_BLOCK];
+
+    int tid = threadIdx.x;
+    int warpId = tid / 32, laneId = tid % 32;
+    const float* x = inp + blockIdx.x * C;
+    float* y = out + blockIdx.x * C;
+
+    // ----- 第一趟：求最大值（8x 展开）-----
+    float maxval = -INFINITY;
+    for (int i = tid; i < C; i += blockDim.x * 8) {
+        float reg[8];
+        #pragma unroll
+        for (int u = 0; u < 8; u++)
+            reg[u] = __ldcs(&x[min(C-1, i + u * blockDim.x)]);  // 优化点4+5
+        #pragma unroll
+        for (int u = 0; u < 8; u++)
+            maxval = fmaxf(maxval, reg[u]);
+    }
+    maxval = warpReduceMax(maxval);  // v4 的两级规约
+    if (laneId == 0) maxvals[warpId] = maxval;
+    __syncthreads();
+    if (tid == 0) {
+        float val = maxvals[0];
+        for (int i = 1; i < WARPS_PER_BLOCK; i++) val = fmaxf(val, maxvals[i]);
+        maxvals[0] = val;
+    }
+    __syncthreads();
+    float offset = maxvals[0];
+
+    // ----- 第二趟：exp + 写回 + 寄存器内局部求和（三合一）-----
+    float sumval = 0.0f;
+    for (int i = tid; i < C; i += blockDim.x * 8) {
+        float reg_array[8];
+        // 优化点6：先批量加载到寄存器
+        #pragma unroll
+        for (int u = 0; u < 8; u++)
+            reg_array[u] = __ldcs(&x[min(C-1, i + u * blockDim.x)]);
+        // 优化点2：批量计算、写回、寄存器内累加（省一趟全局读）
+        #pragma unroll
+        for (int u = 0; u < 8; u++) {
+            if (i + u * blockDim.x < C) {
+                float output = expf(reg_array[u] - offset);
+                y[i + u * blockDim.x] = output;
+                sumval += output;
+            }
+        }
+    }
+    // 规约 sumval（和 maxval 同样的两级规约）
+    sumval = warpReduceSum(sumval);
+    if (laneId == 0) sumvals[warpId] = sumval;
+    __syncthreads();
+    if (tid == 0) {
+        float val = sumvals[0];
+        for (int i = 1; i < WARPS_PER_BLOCK; i++) val += sumvals[i];
+        sumvals[0] = val;
+    }
+    __syncthreads();
+    float total_sum = sumvals[0];
+
+    // ----- 第三趟：归一化（8x 展开）-----
+    for (int i = tid; i < C; i += blockDim.x * 8) {
+        #pragma unroll
+        for (int u = 0; u < 8; u++) {
+            int idx = i + u * blockDim.x;
+            if (idx < C) y[idx] /= total_sum;
         }
     }
 }
 ```
 
-### 效果
+### 性能表现
 
 | 指标 | v4 | v5 | 变化 |
 |---|:---:|:---:|:---:|
-| 耗时 (ms) | 14.35 | **10.56** | **快26%** |
-| Compute (%) | 27.28 | 36.26 | +33% |
-| Memory (%) | 60.66 | **85.06** | +40% |
+| 耗时 (ms) | 14.35 | **10.56** | **快 26%** |
+| Memory Throughput (%) | 60.66 | **85.06** | +40% |
+| Compute Throughput (%) | 27.28 | 36.26 | +33% |
 
-v5 是标准 Softmax 最优版本，Memory Throughput 达到 85.06%，接近 DRAM 带宽物理上限。
+8x 循环展开让编译器批量发射 load，计算合并省掉了一整趟全局内存读 exp 结果。Memory Throughput 从 60% 拉到 85%，DRAM 带宽基本吃满。
+
+![v4 vs v5 max 循环 SASS 对比](images/softmax7.png)
+
+上面这张图是两个 kernel max 循环的 SASS 对比：
+
+- **v4**（上半部分）：一个循环体只有 1 个 LDG.E（行 21），发完 load 要等数据回来才能算 FMNMX，然后再加计数器、判断分支，才能发下一个 load。每次只有 1 个内存请求在飞。
+- **v5**（下半部分）：一个循环体连续发射 8 个 LDG.E（行 49、55、58、65、72、75、79、80），然后连续做 8 次 FMNMX。编译器一次性发出 8 个内存请求，中间的地址计算（LEA/IADD）穿插在 load 之间，不影响发射节奏。
+
+这是 v5 带宽从 60% 跳到 85% 的根本原因，编译器帮 v5 做了 v4 没有的事。（v4 输给 v2 也是这个原因，详见其附录，这里不重复）
+
+![v4 vs v5 管线利用率对比](images/softmax8.png)
+
+管线利用率的变化和 SASS 证据一致：
+
+| | v4 | v5 |
+|---|:---:|:---:|
+| LSU 管线利用率 | 27% | 33% |
+| ALU Heavy 管线利用率 | 22% | 30% |
+
+v5 的 LSU 利用率上去了——因为 8 个 load 同时在飞，访存管线不再空闲。ALU Heavy 也涨了——8 次 FMNMX 和 8 次 exp 计算需要更多 ALU 资源。两边都忙了，说明指令调度和内存请求的配合更紧凑。
+
+>即使 v5 跑到了 85% 带宽，LSU 管线也只用了 33%。这不是说访存管线有空闲，而是因为 Softmax 是访存受限算子——GPU 内部管线虽还有余力，但 DRAM 带宽已经喂饱了。剩下的算力空转是访存受限的正常表现。
+
+### 版本定位
+
+这是**普通 softmax 的最优版本**。在不改变算法结构（遍历三趟全局内存）的前提下，通过循环展开、计算合并和流式访存，让带宽利用率靠近硬件极限。
+
+在寄存器压力范围内，通过调整循环展开因子的小大，或配合向量化访存技术，往往能进一步压榨带宽。
+
+<br>
+
+---
+
+## 额外对比实验：v10 — 二分规约 vs 两级规约
+
+v5 用的是 v4 的**两级规约**骨架（Warp Shuffle + 跨 Warp 共享内存）。
+
+v10 则在 v2 的**共享内存二分规约**的骨架基础上，运用同样的优化（8x 展开、计算合并、`__ldcs`、读写分离、边界处理）。两个 kernel 唯一的区别就是规约机制。
+
+```cuda
+// v5  = v4 骨架（两级规约） + 循环展开 + 计算合并 + 读写分离 + __ldcs
+// v10 = v2 骨架（二分规约） + 循环展开 + 计算合并 + 读写分离 + __ldcs
+// 除了骨架不同，优化手段与 v5 完全一致
+
+// 两版共同的主循环：8x 展开 + __ldcs + 计算合并 + 读写分离
+float sumval = 0.0f;
+for (int i = tid; i < C; i += block_size * 8) {
+    float reg[8];
+    // 阶段 1：批量加载到寄存器（8x 展开，一次发 8 个 load）
+    #pragma unroll
+    for (int u = 0; u < 8; u++)
+        reg[u] = __ldcs(&x[min(C-1, i + u * block_size)]);
+    // 阶段 2：批量计算、写回、寄存器内累加 sum（省一趟全局读）
+    #pragma unroll
+    for (int u = 0; u < 8; u++) {
+        if (i + u * block_size < C) {
+            float output = expf(reg[u] - offset);
+            y[i + u * block_size] = output;
+            sumval += output;
+        }
+    }
+}
+
+// 唯一区别是规约方式：
+// v10：二分规约（全 Block 共享内存）
+shared[tid] = maxval;
+__syncthreads();
+for (int stride = block_size / 2; stride >= 1; stride /= 2) {
+    if (tid < stride)
+        shared[tid] = fmaxf(shared[tid], shared[tid + stride]);
+    __syncthreads();
+}
+float offset = shared[0];
+
+// sum 的规约同理...
+```
+
+![v5 vs v10](images/softmax8.png)
+
+| 指标 | v5（两级规约） | v10（二分规约） |
+|---|:---:|:---:|
+| 耗时 (ms) | 10.53 | 10.33 |
+| Memory Throughput (%) | 85.18 | 85.91 |
+| Compute Throughput (%) | 36.36 | 41.07 |
+| Registers | 40 | 46 |
+
+两者性能基本相同（差距在测速误差范围内），Memory Throughput 都在 85% 左右，卡在同一个带宽天花板。
+
+**结论：当两个 kernel 都被正确展开、带宽都吃满后，规约机制的差异对性能没有太多影响。** 规约只处理 block_size 个标量，在全局内存读写（50257 个值）面前占比极小，机制差异几乎被带宽瓶颈淹没。
+
+>这也验证了末尾附录的结论：v4 比 v2 慢的原因是编译器没展开 v4，不是两级规约算法本身有问题。
 
 <br>
 
@@ -662,3 +803,144 @@ v9 (10.86ms)   在线 + 块级并行，以 2 趟访存追平三趟法
 
 3. **低精度支持**
    当前基于 FP32。若改为 BF16/FP16，数据量减半，DRAM 流量减半，理论上可获得近 2 倍带宽收益。累加 sum 时仍需用 FP32 保持数值稳定。
+
+<br>
+<br>
+
+---
+
+## 附录：v4 为什么比 v2 慢？—— SASS 分析
+
+v4 的两级规约在算法上明显优于 v2 的共享内存二分规约，但实测反而慢了 24%。这个反直觉的结果值得单独拆解。
+
+### 现象
+
+| | v2 | v4 |
+|---|:---:|:---:|
+| 耗时 | **11.52 ms** | 14.35 ms |
+| DRAM 带宽利用率 | **78.16%** | 60.66% |
+| 总执行指令数 | 3.96 亿 | 6.30 亿（+59%） |
+| Load/Store 指令数 | 7720 万 | 7720 万（完全相同） |
+
+两个 Kernel 读了同样多的数据，但 v4 多跑了 59% 的指令，DRAM 带宽反而更低。
+
+### NCU 数据
+
+![v2 vs v4 指令分类对比](images/softmax2.png)
+
+多出来的 2.33 亿条指令全部是 ALU 类（v2 Integer 类别 1.87 亿，v4 3.61 亿）。访存指令数两者完全一致。
+
+![v2 vs v4 管线利用率对比](images/softmax3.png)
+
+v4 的 ALU Heavy 管线占用是 v2 的 2.1 倍，但 LSU（访存管线）利用率反而从 36% 降到 27%。
+
+![v2 vs v4 Warp State 对比](images/softmax4.png)
+
+v4 的 Long Scoreboard stall（等内存数据返回）比例更低（37% vs 47%），说明单条指令的执行效率并不差。问题不在"算得慢"，而在"同时在飞的内存请求不够多"。
+
+### SASS 反汇编：真正的原因
+
+对两个 Kernel 的 SASS 逐行分析后，发现了一个 NCU 指标无法直接看到的事实：
+
+**v2 的主循环被 nvcc 自动 4 倍展开了，v4 的主循环完全没有展开。**
+
+#### v2 的主循环（max 遍历）
+
+SASS 中 v2 的 max 循环（`.L_x_5`）一个循环体里发射了 **4 个 LDG.E** 全局加载指令，循环计数器一次加 4 倍步长：
+
+```
+LDG.E R4, [addr0]              # load 1
+IMAD.WIDE R8, R3, 0x4, R6      # 算下一个地址
+LDG.E R6, [addr1]              # load 2
+IMAD.WIDE R10, R3, 0x4, R8     # 算下一个地址
+LDG.E R2, [addr2]              # load 3
+LDG.E R10, [addr3]             # load 4
+IADD3 R12, R12, R3, R3         # 计数器加 2 倍步长
+IADD3 R12, R12, R3, R3         # 再加 2 倍步长（共 4 倍）
+ISETP.GE.AND P1, R12, UR6      # 循环条件
+FMNMX.FTZ R13, R4, R13         # max with load 1
+FMNMX.FTZ R13, R13, R6         # max with load 2
+FMNMX.FTZ R13, R13, R2         # max with load 3
+FMNMX.FTZ R13, R13, R10        # max with load 4
+@!P1 BRA .L_x_5                # 分支
+```
+
+4 个 load 指令密集排列在循环体前半段，编译器一次性发出 4 个内存请求。IMAD.WIDE（地址计算）穿插在 load 之间，不影响 load 的发射节奏。
+
+![v2 max 循环 SASS 截图](images/softmax5.png)
+
+exp 循环、sum 循环、normalize 循环全部同样是 4 倍展开。
+
+#### v4 的主循环（max 遍历）
+
+v4 的 max 循环（`.L_x_2`）一个循环体里只有 **1 个 LDG.E**：
+
+```
+LDG.E R3, [addr]               # load
+IADD R5, R5, UR11              # 计数器加 1 倍步长
+ISETP.GE.AND P1, R5, UR15      # 循环条件
+FMNMX.FTZ R4, R3, R4           # max（必须等 load 数据回来）
+@!P1 BRA .L_x_2                # 分支
+```
+
+注意：编译器把 IADD 和 ISETP 插在 LDG 和 FMNMX 之间，因为这两条不依赖 load 结果——趁内存返回的间隙先做循环控制。但即使如此，一个循环体也只有 1 个 load 发出。
+
+![v4 max 循环 SASS 截图](images/softmax6.png)
+
+exp、sum、normalize 循环也全部是 1 倍，没有展开。
+
+#### 这意味着什么
+
+访存受限算子的性能取决于**同时在飞的内存请求数**（Memory Level Parallelism, MLP）。v2 每轮循环同时发 4 个 load，v4 只发 1 个。
+
+```
+v2: [load0] [load1] [load2] [load3] ← 4个请求同时在飞
+    ↓ 等数据回来，做计算，发下一批 4 个
+
+v4: [load0] → 等数据回来 → 算 → 地址加完 → 发 [load1] → 等 → ...
+    ↓ 每次只有 1 个请求在飞
+```
+
+v4 的 DRAM 有大量空闲缝隙：发完一个 load，要算地址、加计数器、判断分支，才能发下一个。v2 把 4 个 load 打包发出去，中间的计算被内存延迟完全掩盖。
+
+#### 多出来的 2.33 亿条指令是什么？
+
+v2 展开后，地址计算指令（SHF / MOV / IADD.64 / LEA / LEA.HI.X）在循环前算一次，服务 4 个 load。v4 每发 1 个 load 都要重新算一遍完整地址。
+
+| 每发 1 个 load 需要的地址计算指令 | v2（4x 展开） | v4（1x） |
+|---|:---:|:---:|
+| SHF / MOV / IADD.64 / LEA / LEA.HI.X | 摊到 4 个 load 上 | 每 load 都要 |
+| 循环计数器 IADD | 摊到 4 个 load 上 | 每 load 都要 |
+| 分支 BRA | 摊到 4 个 load 上 | 每 load 都要 |
+
+粗算：v4 每 load 比 v2 多约 5 条整数指令，5148 万条 load × 5 ≈ 2.57 亿条，与实测多出来的 2.33 亿基本吻合。
+
+#### 关于之前被推翻的假设
+
+在 SASS 分析之前，我们曾推测过两个原因，现在都被推翻了：
+
+1. **"v2 的 stride<32 规约被编译器优化成了 Shuffle"** —— SASS 中 v2 的规约循环全程使用 LDS/STS + BAR.SYNC，没有任何 SHFL 指令。7 轮规约全部走共享内存。这个说法不成立。
+2. **"v4 的 0 号线程串行合并是关键路径瓶颈"** —— 这段代码只在 thread 0 上执行一次，占比 <0.01%，对总耗时影响可忽略。
+
+### 为什么编译器展开了 v2 却没展开 v4？
+
+SASS 无法直接回答编译器内部为什么做了这个选择。可能的因素：
+
+- v4 的规约代码块更大（5 条 SHFL + 80 多条 thread 0 串行合并的统一指令），编译器担心展开后主代码膨胀
+- v4 在循环和规约之间有更多寄存器存活（shuffle 中间结果），展开会增加寄存器压力
+- 纯粹是 nvcc 启发式的选择，换个 `-O` 选项或编译器版本可能结果就反转
+
+**这个"为什么"我们无法从 SASS 直接确认，因此不做定论。** 但 SASS 证据本身是确凿的：v2 展开了，v4 没展开，这直接解释了带宽和指令数的差异。
+
+### 启示
+
+这个案例说明：**GPU 性能优化不能只看算法逻辑，还要看编译器最终生成了什么。** 一个"算法上更优"的实现，如果编译器没有帮你展开循环、批量发射 load，在访存受限场景下可能反而更慢。这也是为什么 v5 在 v4 的骨架上手动加了 `#pragma unroll`——显式告诉编译器必须展开，不要自己做决定。
+
+1. **Float4 向量化访存**
+   当前 v5/v9 仍是标量加载（4 字节/次），改为 `float4`（16 字节/次）可将访存指令数减至 1/4，进一步压榨带宽利用率。需处理 C 非 4 对齐的边界。
+
+2. **低精度支持**
+   当前基于 FP32。若改为 BF16/FP16，数据量减半，DRAM 流量减半，理论上可获得近 2 倍带宽收益。累加 sum 时仍需用 FP32 保持数值稳定。
+
+3. **向 Flash Attention 演进**
+   本仓库实现的是独立 Softmax 算子。真正的工程价值在于将 v9 的在线 Softmax 框架嵌入 Flash Attention 的分块流水线（见 v9 章节），实现 QK^T → softmax → V 的端到端 SRAM 计算。

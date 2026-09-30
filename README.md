@@ -100,7 +100,14 @@ __global__ void softmax_forward_kernel1(float* out, const float* inp, int N, int
 
 ## v2 — 单 Block 一行：共享内存二分规约
 
-v1 的问题是并行度太低且访存不合并。v2 改为**一个 Block 处理一行**，块内所有线程协作分摊 `C` 个元素：**并行度极大提升**，相邻线程访问连续地址，**恢复合并访存**。
+v1 的两个致命问题是并行度不足和访存不合并。v2 改变任务划分方式：一个 Block 处理一行，块内所有线程协作分摊 C 个元素。
+
+这样做同时解决两个问题：
+1. 相邻线程访问连续地址（thread 0 读 x[0]、thread 1 读 x[1]……），访存自然合并；
+2. Block 内 512 个线程一起算一行，并行度提升 512 倍。
+
+### 实现逻辑
+块内规约用经典的共享内存二分规约：每个线程先求自己负责部分的局部最大值，写入共享内存，然后每轮 stride 折半合并。
 
 ```cuda
 __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int C) {
@@ -147,14 +154,14 @@ __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int
 ### 效果
 
 - 耗时从 v1 的 105.91ms 降到 **11.52ms**——约 9 倍提升。
-- Memory Throughput 从 45.84% 提升到 78.16%——合并访存恢复后带宽被利用起来。
-- Compute Throughput 从 12.43% 提升到 36.39%——SM 开始干活。
+- Memory Throughput 从 45.84% 提升到 78.16%——这是本次优化最大的收益来源。
 
 ### 现存问题
 
 1. **共享内存二分规约同步开销大**：每轮 stride 都要 `__syncthreads()`，block_size=512 时需要 9 轮同步。
 2. **中间结果写了又读**：第二趟把 exp 结果写到 `out`，第三趟又从 `out` 读回来求 sum，多一次全局内存往返。
-3. **标量访存**：每次只加载 1 个 float（4 字节），访存指令数多，可通过向量化访存压缩指令数。（向量化是通用技术，本篇专注 softmax 本身的优化原理，所以不再演示）
+3. **标量访存**：每次只加载 1 个 float（4 字节），访存指令数多，可通过向量化访存压缩指令数。
+> 向量化访存是通用优化技术，本篇专注 softmax 本身的优化理论，所以不再展开
 
 <br>
 
@@ -218,7 +225,7 @@ __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int
 | 显存带宽利用率 | 78.16% | 57.09% |
 | 计算单元利用率 | 36.39% | 8.49% |
 
-分析三层原因：
+**分析三层原因：**
 
 1. **单 Warp Block 无法打满 SM 调度槽**
 
@@ -233,7 +240,7 @@ __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int
 3. **长串行循环的延迟被放大**
 
   每行 50257 个元素分摊到 32 个线程，每线程要串行遍历约 1570 次循环，循环内部存在数据依赖。
-  
+
   Warp 数量充足时，不同 Warp 的循环可以在硬件上重叠执行；Warp 数量不足时，长依赖链的延迟无法被并行掩盖，进一步拉长总耗时。
 
 ---
@@ -242,7 +249,7 @@ __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int
 
 这是一个**教学演示版本**，价值在于清晰展示 Warp 级规约的最简写法和核心思想。
 
-如果要发挥 Warp Shuffle 规约的优势，正确的做法是 **将多个 Warp 打包进同一个 Block**（每个 Warp 各处理一行），既保留寄存器级规约的低延迟，又保证足够的 SM 占用率。参考 v7
+如果要发挥 Warp Shuffle 规约的优势，正确的做法是 **将多个 Warp 打包进同一个 Block**（每个 Warp 各处理一行），既保留寄存器级规约的低延迟，又保证足够的 SM 占用率。参考 v7。
 
 <br>
 

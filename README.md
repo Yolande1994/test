@@ -169,9 +169,9 @@ __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int
 
 ---
 
-## v3 — 单 Warp 行级规约：纯寄存器通信的极简实现（演示 warp 级并行）
+## v3 — 单 Warp 行级规约：纯寄存器通信的极简实现（规约机制的演示）
 
-这个版本采用「一个 Warp（32 线程）处理一行数据」的设计，全程使用 Warp Shuffle 指令完成行内规约，完全不使用共享内存，也没有块级同步操作。
+该版本仅用于介绍 warp 规约，采用「一个 Warp（32 线程）处理一行数据」的设计，全程使用 Warp Shuffle 指令完成行内规约，完全不使用共享内存，也没有块级同步操作。
 
 ### 设计思路
 
@@ -214,9 +214,7 @@ __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int
 
 ### 性能表现
 
-在 C=50257、block=32 的配置下，单 Kernel 耗时 44.93ms。相比 v2 共享内存块级规约（block=512，耗时 11.52ms），**反而慢了约 4 倍**。
-
-### 为什么更快的原语反而得到更差的性能？
+在 C=50257、block=32 的配置下，单 Kernel 耗时 44.93ms。相比 v2 共享内存块级规约（block=512，耗时 11.52ms），**慢了约 4 倍**。
 
 >这是个典型「局部最优 ≠ 全局最优」的演示。只看规约操作本身，Shuffle 寄存器通信确实比共享内存更快，但放在整个 Kernel 的尺度上，这个设计带来了更严重的硬件利用率问题。
 
@@ -251,7 +249,7 @@ __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int
 
 这是一个**教学演示版本**，价值在于清晰展示 Warp 级规约的最简写法和核心思想。
 
-如果要发挥 Warp Shuffle 规约的优势，正确的做法是 **将多个 Warp 打包进同一个 Block**（每个 Warp 各处理一行），既保留寄存器级规约的低延迟，又保证足够的 SM 占用率。参考 v7。
+如果要发挥 Warp Shuffle 规约的优势，正确的做法是 **将多个 Warp 打包进同一个 Block**（每个 Warp 各处理一行），既保留寄存器级规约的低延迟，又保证足够的 SM 占用率。参考 v7、v8。
 
 <br>
 
@@ -306,7 +304,7 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
 | 共享内存 | block_size 个 float | warpsPerBlock 个 float |
 | block=1024 时 | 1024 × 4B = 4 KB | 32 × 4B = 128 B |
 
-共享内存占用降低 32 倍，理论上 SM 可驻留更多 Block。
+>共享内存占用降低 32 倍，理论上 SM 可驻留更多 Block。
 
 ### 效果表现
 

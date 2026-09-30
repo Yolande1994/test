@@ -94,9 +94,9 @@ __global__ void softmax_forward_kernel1(float* out, const float* inp, int N, int
 
 > Compute Throughput 只有 12.43%，Memory Throughput 也只有 54.60%——既没吃满算力，也没吃满带宽。
 
-<br>
-
 ---
+
+<br>
 
 ## v2 — 单 Block 一行：共享内存二分规约
 
@@ -156,7 +156,7 @@ __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int
 ### 效果
 
 - 耗时从 v1 的 105.91ms 降到 **11.52ms**——约 9 倍提升。
-- Memory Throughput 从 45.84% 提升到 78.16%——这是本次优化最大的收益来源。
+- Memory Throughput 从 45.84% 提升到 78.16%——本次优化最大的收益来源。
 
 ### 现存问题
 

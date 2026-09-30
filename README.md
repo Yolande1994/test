@@ -497,6 +497,8 @@ float offset = shared[0];
 // sum 的规约同理...
 ```
 
+### 性能表现
+
 ![v5 vs v10](images/softmax9.png)
 
 | 指标 | v5（两级规约） | v10（二分规约） |

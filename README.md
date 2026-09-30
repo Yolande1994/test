@@ -244,7 +244,7 @@ __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int
 3. **两者叠加 → 访存延迟无法隐藏**
 
    GPU 隐藏访存延迟的手段是：一个 Warp 等内存时，SM 切换到另一个就绪 Warp 继续执行。
-   
+
    v3 同时存在两个问题：活跃 Warp 总数只有 v2 的一半（第 2 点），且每个 Warp 的串行链又长 16 倍（第 1 点）。遇到访存时既没有足够多的其他 Warp 可切换，单个 Warp 内部也没有足够的独立指令来重叠，内存延迟暴露，带宽利用率从 78% 跌到 57%。Softmax 是访存受限算子，带宽上不去，性能就直接下降。
 
 ### 版本定位
@@ -259,9 +259,14 @@ __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int
 
 ## v4 — 块级两级规约
 
-v4 回归「1 个 Block 处理 1 行」，但规约改用两级结构：
-- 第一级（Warp 内）：32 线程用 shuffle 指令做寄存器级规约，延迟极低
-- 第二级（跨 Warp）：各 Warp 的 0 号线程把结果写入共享内存，由 block 内 0 号线程串行合并
+### 设计思路
+
+v2 的共享内存二分规约需要把 block_size 个中间值全部写入共享内存，每轮都同步。v4 沿用 v2 的"一 Block 处理一行"划分，但把规约拆成两级：
+
+- **第一级（Warp 内）**：32 个线程用 Shuffle 指令在寄存器内完成规约，不需要共享内存，也不需要块级同步。
+- **第二级（跨 Warp）**：每个 Warp 的 lane 0 把结果写入共享内存（只需 warpsPerBlock 个 float），由 Block 主线程串行合并。
+
+这样共享内存用量从 block_size 个降到 warpsPerBlock 个 float，块级同步次数也从 log2(block_size) 次降到 1 次。
 
 ```cuda
 __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int C) {
@@ -270,10 +275,10 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
     int tid = threadIdx.x;
     int warpId = tid / 32;
     int laneId = tid % 32;
-    int warpsPerBlock = blockDim.x / 32;
+    int warpsPerBlock = blockDim.x / 32;  // 块内 warp 数量
     const float* x = inp + bid * C;
 
-    // 求最大值：线程粗化 + 两级规约
+    // 求最大值：跨步分摊 + 两级规约
     float maxval = -INFINITY;
     for (int i = tid; i < C; i += blockDim.x)
         maxval = fmaxf(maxval, x[i]);
@@ -301,23 +306,24 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
 | 共享内存 | block_size 个 float | warpsPerBlock 个 float |
 | block=1024 时 | 1024 × 4B = 4 KB | 32 × 4B = 128 B |
 
-共享内存占用降低 32 倍，SM 可驻留更多 Block。
+共享内存占用降低 32 倍，理论上 SM 可驻留更多 Block。
 
-### 效果
+### 效果表现
 
-耗时 14.35ms，比 v2 的 11.52ms 反而慢。
+耗时 14.35ms，比 v2 的 11.52ms **反而慢了**，Memory Throughput 从 78.16% 降到 60.66%。
 
-Memory Throughput 66.66%，比 v2 的 78.16% 低。
+### 为什么两级规约没有跑赢共享内存二分规约？
 
-**为什么两级规约没有跑赢共享内存二分规约？**
+v2 和 v4 的宏观任务划分完全一致（1 Block 处理 1 行），差别只在规约机制。理论上两级规约应该更快，但实测反而更慢。原因在于：
 
-v2 和 v4 宏观任务划分完全一致（1 Block 处理 1 行），差别只在规约机制。理论上 v4 的两级规约应该更快，但实测反而更慢。可能的原因：
+1. **v2 的二分规约被编译器深度优化**：当 stride < 32 时，规约只在单个 Warp 内进行，编译器可以直接将其转为寄存器操作（和 Shuffle 等效），实际块级同步次数远低于理论上的 log2(block_size)。
+2. **v4 引入了额外开销**：warpId/laneId 的整数计算、跨 Warp 写共享内存、主线程串行合并——在 C=50257 的大场景下，这些开销相对于 5 万次循环虽然不大，但也无法忽略。
 
-1. **v2 的二分规约在 C 很大时被编译器充分优化**：stride < 32 的那几轮其实只在 Warp 0 内操作，编译器可以将其转为寄存器通信甚至内联展开，实际同步次数远低于理论上的 log2(block_size)。
+> "两级规约一定更快"是有前提的——需要结合 C 的大小和编译器优化程度判断。在这个测试环境下，v2 的朴素二分规约反而被编译器优化到了极致。
 
-2. **v4 引入了额外的整数计算和分支**：warpId / laneId 的计算、__shfl_down_sync 的 5 轮 shuffle、跨 Warp 写共享内存——在 C 很大时这些开销相对不大，但仍不可忽略。
+### 版本定位
 
-> v2 和 v4 都是合理的规约方案，"两级规约一定更快"是有前提的——需要结合实际 C 的大小和编译器优化程度判断。
+v4 是 v5 的**架构基础**。虽然两级规约本身没有跑赢 v2，但它大幅降低了共享内存占用，为后续 v5 的循环展开和计算合并提供了更干净的骨架。
 
 <br>
 

@@ -13,9 +13,9 @@
 标准做法需要三趟遍历一行：
 
 ```
-maxval = max(row)                # 第一趟：求行内最大值（避免 exp 上溢）
-sum    = Σ exp(row - maxval)     # 第二趟：计算指数并求和
-out    = exp(row - maxval) / sum # 第三趟：归一化写回
+maxval = max(row)                  # 第一趟：求行内最大值（避免 exp 上溢）
+sum    = Σ exp(row - maxval)       # 第二趟：计算指数并求和
+out    = exp(row - maxval) / sum   # 第三趟：归一化写回
 ```
 
 >数值稳定性：`exp(x)` 在 `x > 88` 时会上溢为 inf，因此先减去行内最大值再算指数，数学上等价但数值稳定。

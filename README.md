@@ -430,14 +430,14 @@ __global__ void softmax_forward_kernel5(float* out, const float* inp, int N, int
 
 **管线利用率截图，左边 v4，右边 v5：**
 
+>GPU 内部各条执行流水线的繁忙程度，百分比 = 实际指令发射速度 / 该管线的峰值速度。
+
 ![v4 vs v5 管线利用率对比](images/softmax8.png)
 
 | | v4 | v5 |
 |---|:---:|:---:|
 | LSU 管线利用率 | 27% | 33% |
 | ALU Heavy 管线利用率 | 22% | 30% |
-
->GPU 内部各条执行流水线的繁忙程度，百分比 = 实际指令发射速度 / 该管线的峰值速度。
 
 管线利用率的变化和 SASS 证据一致：v5 的访存管线更忙了——8 个 load 一起发，单位时间内搬运的数据更多。计算管线也更忙了——同样的计算量在更短时间里完成。
 
@@ -497,7 +497,7 @@ float offset = shared[0];
 // sum 的规约同理...
 ```
 
-![v5 vs v10](images/softmax8.png)
+![v5 vs v10](images/softmax9.png)
 
 | 指标 | v5（两级规约） | v10（二分规约） |
 |---|:---:|:---:|

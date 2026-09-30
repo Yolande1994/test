@@ -88,9 +88,9 @@ __global__ void softmax_forward_kernel1(float* out, const float* inp, int N, int
 
 ### 问题
 
-1. **并行度严重不足**：每线程负责一行，只有 N = B*T = 8192 个线程，而 GPU 有数十个 SM 且每个 SM 都可以驻留上千个线程。这点线程远填不满硬件。
+1. **并行度严重不足**：每线程负责一行，N = B*T 不过 8192 个线程，而 GPU 有数十个 SM 且每个 SM 都可以驻留上千个线程。这点线程远填不满硬件。
 2. **访存不合并**：相邻线程处理的行地址间隔 `C=50257` 个元素，Warp 内 32 个线程访问完全离散的地址，带宽利用率极低。
-3. **长串行依赖**：单线程串行跑 5 万次循环，单线程内部强数据依赖，Warp 内部指令无法并行（ILP 很难展开），无法靠指令级并行隐藏循环延迟。
+3. **长串行依赖**：单线程串行跑 5 万次循环，单线程内部强数据依赖，Warp 内部指令无法并行（ILP 难展开），无法靠指令级并行隐藏循环延迟。
 
 > Compute Throughput 只有 12.43%，Memory Throughput 也只有 54.60%——既没吃满算力，也没吃满带宽。
 
@@ -160,7 +160,7 @@ __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int
 
 ---
 
-## v3 — 单 Warp 一行：纯 Shuffle 规约
+## v3 — 单 Warp 一行：纯 Shuffle 规约（演示 warp 级并行）
 
 v2 的共享内存二分规约有同步开销。v3 把任务划分缩小到**一个 Warp 处理一行**，块大小固定为 32，全程用 `__shfl_down_sync` 完成 Warp 内规约，没有共享内存和块级同步。
 

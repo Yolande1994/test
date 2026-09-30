@@ -94,9 +94,9 @@ __global__ void softmax_forward_kernel1(float* out, const float* inp, int N, int
 
 > Compute Throughput 只有 12.43%，Memory Throughput 也只有 54.60%——既没吃满算力，也没吃满带宽。
 
----
-
 <br>
+
+---
 
 ## v2 — 单 Block 一行：共享内存二分规约
 
@@ -169,9 +169,9 @@ __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int
 
 ---
 
-## v3 — 单 Warp 行级规约：纯寄存器通信的极简实现（规约机制的演示）
+## v3 — 单 Warp 行级规约：纯寄存器通信的极简实现（规约机制演示）
 
-该版本仅用于介绍 warp 规约，采用「一个 Warp（32 线程）处理一行数据」的设计，全程使用 Warp Shuffle 指令完成行内规约，完全不使用共享内存，也没有块级同步操作。
+该版本仅用于介绍 warp 规约，采用「一个 Warp（32 线程）处理一行数据」的设计，全程使用 Warp Shuffle 指令完成行内规约，完全不用共享内存，没有块级同步。
 
 ### 设计思路
 
@@ -233,17 +233,17 @@ __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int
 
    v2 用 512 个线程一起算一行，每线程串行遍历约 98 个元素；v3 只有 32 个线程算一行，每线程串行遍历约 1570 个元素——相差 16 倍。
 
-   循环内部有数据依赖（`maxval = fmaxf(maxval, x[i])`），每一轮都要等上一轮算完，串行链越长，延迟越难被其他指令或其他 Warp 掩盖。这是任务划分层面的根本问题。
+   循环内部有数据依赖（`maxval = fmaxf(maxval, x[i])`），每轮都要等上一轮算完，串行链越长，延迟越难被其他指令或其他 Warp 掩盖。
 
 2. **单 Warp Block 打不满 SM 调度槽**
 
-   每个 SM 能同时驻留的 Block 数量有硬件上限。v3 每个 Block 只含 1 个 Warp，当 Block 数达到硬件上限时，SM 上活跃的 Warp 总数也只能到最大值的一半（实测 Occupancy 仅 50%，SM 的 warp slot 有一半空着）。
+   SM 能同时驻留的 Block 数量有硬件上限。v3 每个 Block 只含 1 个 Warp，当 Block 数达到硬件上限时，SM 上的 Warp 总数也只能到最大值的一半（实测 Occupancy 仅 50%，SM 的 warp slot 有一半空着）。
 
 3. **两者叠加 → 访存延迟无法隐藏**
 
    GPU 隐藏访存延迟的手段是：一个 Warp 等内存时，SM 切换到另一个就绪 Warp 继续执行。
 
-   v3 同时存在两个问题：活跃 Warp 总数只有 v2 的一半（第 2 点），且每个 Warp 的串行链又长 16 倍（第 1 点）。遇到访存时既没有足够多的其他 Warp 可切换，单个 Warp 内部也没有足够的独立指令来重叠，内存延迟暴露，带宽利用率从 78% 跌到 57%。Softmax 是访存受限算子，带宽上不去，性能就直接下降。
+   v3 同时存在两个问题：活跃 Warp 总数只有 v2 的一半（第 2 点），且每个 Warp 的串行链又长 16 倍（第 1 点）。遇到访存时既没有足够多的其他 Warp 可切换，单个 Warp 内部也没有足够的独立指令来重叠，内存延迟暴露，带宽利用率从 78% 跌到 57%。
 
 ### 版本定位
 
@@ -419,14 +419,16 @@ __global__ void softmax_forward_kernel5(float* out, const float* inp, int N, int
 
 8x 循环展开让编译器批量发射 load，计算合并省掉了一整趟全局内存读 exp 结果。Memory Throughput 从 60% 拉到 85%，DRAM 带宽基本吃满。
 
+**下面这张图是两个 kernel 遍历求 max 循环的 SASS 对比：**
+
 ![v4 vs v5 max 循环 SASS 对比](images/softmax7.png)
 
-上面这张图是两个 kernel max 循环的 SASS 对比：
-
-- **v4**（上半部分）：一个循环体只有 1 个 LDG.E（行 21），发完 load 要等数据回来才能算 FMNMX，然后再加计数器、判断分支，才能发下一个 load。每次只有 1 个内存请求在飞。
+- **v4**（上半部分）：一个循环体只有 1 个 LDG.E（行 21），发完 load 要等数据回来才能算 FMNMX（浮点取最值指令），然后再加计数器、判断分支，才能发下一个 load。每次只有 1 个内存请求在飞。
 - **v5**（下半部分）：一个循环体连续发射 8 个 LDG.E（行 49、55、58、65、72、75、79、80），然后连续做 8 次 FMNMX。编译器一次性发出 8 个内存请求，中间的地址计算（LEA/IADD）穿插在 load 之间，不影响发射节奏。
 
-这是 v5 带宽从 60% 跳到 85% 的根本原因，编译器帮 v5 做了 v4 没有的事。（v4 输给 v2 也是这个原因，详见其附录，这里不重复）
+这是 v5 带宽从 60% 跳到 85% 的根本原因，编译器帮 v5 做了 v4 没有的事。（v4 输给 v2 也是这个原因，详见其附录）
+
+**管线利用率截图，左边 v4，右边 v5**
 
 ![v4 vs v5 管线利用率对比](images/softmax8.png)
 

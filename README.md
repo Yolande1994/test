@@ -234,15 +234,17 @@ __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int
 1. **每行并行度不足**
 
    v2 用 512 个线程一起算一行，每线程串行遍历约 98 个元素；v3 只有 32 个线程算一行，每线程串行遍历约 1570 个元素——相差 16 倍。
+
    循环内部有数据依赖（`maxval = fmaxf(maxval, x[i])`），每一轮都要等上一轮算完，串行链越长，延迟越难被其他指令或其他 Warp 掩盖。这是任务划分层面的根本问题。
 
 2. **单 Warp Block 打不满 SM 调度槽**
 
-   每个 SM 能同时驻留的 Block 数量有硬件上限。v3 每个 Block 只含 1 个 Warp，当 Block 数达到硬件上限时，SM 上活跃的 Warp 总数也只能到最大值的一半——实测 Occupancy 仅 50%，SM 的 warp slot 有一半空着。
+   每个 SM 能同时驻留的 Block 数量有硬件上限。v3 每个 Block 只含 1 个 Warp，当 Block 数达到硬件上限时，SM 上活跃的 Warp 总数也只能到最大值的一半（实测 Occupancy 仅 50%，SM 的 warp slot 有一半空着）。
 
 3. **两者叠加 → 访存延迟无法隐藏**
 
    GPU 隐藏访存延迟的手段是：一个 Warp 等内存时，SM 切换到另一个就绪 Warp 继续执行。
+   
    v3 同时存在两个问题：活跃 Warp 总数只有 v2 的一半（第 2 点），且每个 Warp 的串行链又长 16 倍（第 1 点）。遇到访存时既没有足够多的其他 Warp 可切换，单个 Warp 内部也没有足够的独立指令来重叠，内存延迟暴露，带宽利用率从 78% 跌到 57%。Softmax 是访存受限算子，带宽上不去，性能就直接下降。
 
 ### 版本定位

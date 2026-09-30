@@ -501,12 +501,10 @@ float offset = shared[0];
 
 ![v5 vs v10](images/softmax9.png)
 
-| 指标 | v5（两级规约） | v10（二分规约） |
-|---|:---:|:---:|
-| 耗时 (ms) | 10.53 | 10.33 |
-| Memory Throughput (%) | 85.18 | 85.91 |
-| Compute Throughput (%) | 36.36 | 41.07 |
-| Registers | 40 | 46 |
+| 版本 | 耗时 (ms) | Memory Throughput (%) | Compute Throughput (%) | Registers |
+|---|:---:|:---:|:---:|:---:|
+| v5（两级规约） | 10.53 | 85.18 | 36.36 | 40 |
+| v10（二分规约） | 10.33 | 85.91 | 41.07 | 46 |
 
 两者性能基本相同（差距在测速误差范围内），Memory Throughput 都在 85% 左右，卡在同一个带宽天花板。
 

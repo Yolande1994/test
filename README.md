@@ -88,9 +88,9 @@ __global__ void softmax_forward_kernel1(float* out, const float* inp, int N, int
 
 ### 问题
 
-1. **并行度严重不足**：只有 N = B*T = 8192 个线程，而 GPU 有 26 个 SM，每个 SM 可以驻留上千个线程。这点线程远填不满硬件。
-2. **访存不合并**：相邻线程处理的行地址间隔 `C=50257` 个元素，Warp 内 32 个线程访问完全不连续的地址，每个 32 字节 Cache Line 只用到 4 字节，带宽利用率极低。
-3. **长串行依赖**：单线程串行跑 5 万次循环，延迟无法被其他 Warp 隐藏。
+1. **并行度严重不足**：每线程负责一行，只有 N = B*T = 8192 个线程，而 GPU 有数十个 SM 且每个 SM 都可以驻留上千个线程。这点线程远填不满硬件。
+2. **访存不合并**：相邻线程处理的行地址间隔 `C=50257` 个元素，Warp 内 32 个线程访问完全离散的地址，带宽利用率极低。
+3. **长串行依赖**：单线程串行跑 5 万次循环，单线程内部强数据依赖，Warp 内部指令无法并行（ILP 很难展开），无法靠指令级并行隐藏循环延迟。
 
 > Compute Throughput 只有 12.43%，Memory Throughput 也只有 54.60%——既没吃满算力，也没吃满带宽。
 
@@ -100,7 +100,7 @@ __global__ void softmax_forward_kernel1(float* out, const float* inp, int N, int
 
 ## v2 — 单 Block 一行：共享内存二分规约
 
-v1 的问题是并行度太低且访存不合并。v2 改为**一个 Block 处理一行**，块内所有线程协作分摊 `C` 个元素：相邻线程访问连续地址，**恢复合并访存**。
+v1 的问题是并行度太低且访存不合并。v2 改为**一个 Block 处理一行**，块内所有线程协作分摊 `C` 个元素：**并行度极大提升**，相邻线程访问连续地址，**恢复合并访存**。
 
 ```cuda
 __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int C) {
@@ -109,7 +109,7 @@ __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int
     int tid = threadIdx.x;
     const float* x = inp + bid * C;
 
-    // 一、求最大值（线程粗化 + 共享内存二分规约）
+    // 一、求最大值（共同分摊 + 共享内存二分规约）
     float maxval = -INFINITY;
     for (int i = tid; i < C; i += blockDim.x)
         maxval = fmaxf(maxval, x[i]);
@@ -154,7 +154,7 @@ __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int
 
 1. **共享内存二分规约同步开销大**：每轮 stride 都要 `__syncthreads()`，block_size=512 时需要 9 轮同步。
 2. **中间结果写了又读**：第二趟把 exp 结果写到 `out`，第三趟又从 `out` 读回来求 sum，多一次全局内存往返。
-3. **标量访存**：每次只加载 1 个 float（4 字节），访存指令数多。
+3. **标量访存**：每次只加载 1 个 float（4 字节），访存指令数多，可通过向量化访存压缩指令数。（向量化是通用技术，本篇专注 softmax 本身的优化原理，所以不再演示）
 
 <br>
 

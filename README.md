@@ -533,6 +533,11 @@ float offset = shared[0];
 2. $l_k \times \exp(m_k - m_{k+1})$
 3. $l_{k+1} = l_k \times \exp(m_k - m_{k+1}) + \exp(x_{k+1} - m_{k+1})$
 
+1. 更新最大值：m_{k+1} = max(m_k, x_{k+1})
+2. 折算旧 sum：l_k × exp(m_k - m_{k+1})
+3. 累加新元素：l_{k+1} = l_k × exp(m_k - m_{k+1}) + exp(x_{k+1} - m_{k+1})
+
+
 
 这样不需要提前知道整行最大值，一次遍历就能同时得到 max 和 sum。最后写回时用 $e^{x_i - m} / l$ 归一化即可。
 

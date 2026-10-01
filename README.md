@@ -266,7 +266,7 @@ v4 沿用 v2 的"1 Block 处理一行"划分，但把规约拆成两级：
 - **第一级（Warp 内）**：32 个线程用 Shuffle 指令在寄存器内完成规约，不需要共享内存，也没有块级同步。
 - **第二级（跨 Warp）**：每个 Warp 的 lane 0 把结果写入共享内存（只需 warpsPerBlock 个 float），由 thread 0 读出来合并。
 
-这样共享内存用量从 block_size 个降到 warpsPerBlock 个 float，块级同步次数也从 log2(block_size) 次降到 1 次。
+这样共享内存用量从 block_size 个降到 warpsPerBlock 个 float，块级同步次数从 O(log₂(block_size)) 次降到 O(1) 次
 
 ```cuda
 __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int C) {
@@ -306,7 +306,7 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
 | 共享内存用量 | block_size 个 float | warpsPerBlock 个 float |
 | block=512 时 | 512 × 4B = 2 KB | 16 × 4B = **64 B（省 32 倍）** |
 | Warp 内规约路径 | LDS/STS 共享内存读写 | Shuffle 寄存器通信（延迟更低） |
-| Warp 内规约次数 | 9 轮 | 5 轮 |
+| Warp 内规约次数 | 9 轮（活跃线程数逐轮减半） | 5 轮（全 Warp 参与） |
 | 跨 Warp 同步次数 | 9 次 `__syncthreads()` | 2 次 `__syncthreads()` |
 | 共享内存 Bank Conflict | 每轮多线程并发写，有冲突 | 只有 lane 0 写，无冲突 |
 
@@ -834,17 +834,19 @@ v4 的 Load/Store 指令数更少（0.86 亿 vs 0.78 亿），因为它的共享
 
 ![v2 vs v4 管线利用率对比](images/softmax3.png)
 
-v4 的 ALU Heavy 管线占用是 v2 的 2.1 倍，但 LSU（访存管线）利用率反而从 36% 降到 27%。
+LSU（访存管线）是真正发内存请求的地方。v2 的 LSU 忙了 36%，v4 只有 27%，v4 有更多时间访存管线是空的。
 
 ![v2 vs v4 Warp State 对比](images/softmax4.png)
 
-v4 的 Long Scoreboard stall（等内存数据返回）比例更低（37% vs 47%），说明单条指令的执行效率并不差。问题不在"算得慢"，而在"同时在飞的内存请求不够多"。
+Long Scoreboard stall 是"等 load 数据从 DRAM 回来"的时间占比。v2 的这个 stall 更高（47% vs 37%），但 v2 的带宽也更高。这说明 stall 高不一定是坏事——也许是 GPU 同时在飞的内存请求更饱满。v4 的 stall 更低、带宽也更低，问题出在哪里？
 
 ### SASS 反汇编：真正原因
 
 对两个 Kernel 的 SASS 逐行分析后，发现了一个 NCU 指标无法直接看到的事实：
 
 **v2 的主循环被 nvcc 自动 4 倍展开了，v4 的主循环完全没有展开。**
+
+![v2 max 循环 SASS 截图](images/softmax5.png)
 
 #### v2 的主循环（max 遍历）
 
@@ -867,13 +869,15 @@ FMNMX.FTZ R13, R13, R10        # max with load 4
 @!P1 BRA .L_x_5                # 分支
 ```
 
-4 个 load 指令密集排列在循环体前半段，编译器一次性发出 4 个内存请求。IMAD.WIDE（地址计算）穿插在 load 之间，不影响 load 的发射节奏。
+4 个 load 指令密集排列在循环体前半段，编译器一次性发出 4 个内存请求。
 
-![v2 max 循环 SASS 截图](images/softmax5.png)
+>IMAD.WIDE（地址计算）穿插在 load 之间，不影响 load 的发射节奏
 
 exp 循环、sum 循环、normalize 循环全部同样是 4 倍展开。
 
 #### v4 的主循环（max 遍历）
+
+![v4 max 循环 SASS 截图](images/softmax6.png)
 
 v4 的 max 循环（`.L_x_2`）一个循环体里只有 **1 个 LDG.E**：
 
@@ -885,15 +889,13 @@ FMNMX.FTZ R4, R3, R4           # max（必须等 load 数据回来）
 @!P1 BRA .L_x_2                # 分支
 ```
 
-注意：编译器把 IADD 和 ISETP 插在 LDG 和 FMNMX 之间，因为这两条不依赖 load 结果——趁内存返回的间隙先做循环控制。但即使如此，一个循环体也只有 1 个 load 发出。
-
-![v4 max 循环 SASS 截图](images/softmax6.png)
+>编译器把 IADD 和 ISETP 插在 LDG 和 FMNMX 之间，因为这两条不依赖 load 结果——趁内存返回的间隙先做循环控制。但即使如此，一个循环体也只有 1 个 load 发出。
 
 exp、sum、normalize 循环也全部是 1 倍，没有展开。
 
-#### 这意味着什么
+#### 这意味着什么？
 
-访存受限算子的性能取决于**同时在飞的内存请求数**（Memory Level Parallelism, MLP）。v2 每轮循环同时发 4 个 load，v4 只发 1 个。
+访存受限算子的性能取决于**同时在飞的内存请求数**（MLP）。v2 每轮循环同时发 4 个 load，v4 只发 1 个。
 
 ```
 v2: [load0] [load1] [load2] [load3] ← 4个请求同时在飞
@@ -903,7 +905,12 @@ v4: [load0] → 等数据回来 → 算 → 地址加完 → 发 [load1] → 等
     ↓ 每次只有 1 个请求在飞
 ```
 
-v4 的 DRAM 有大量空闲缝隙：发完一个 load，要算地址、加计数器、判断分支，才能发下一个。v2 把 4 个 load 打包发出去，中间的计算被内存延迟完全掩盖。
+v4 的 DRAM 有大量空闲缝隙：发完一个 load，要算地址、加计数器、判断分支，才能发下一个。v2 把 4 个 load 打包发出去，中间的计算被内存延迟充分掩盖。
+
+上图中的 per-instruction stall 数据可以验证：
+
+- v4 的 FMNMX（取 max）指令 stall 高达 **40.57%**——它必须等 LDG 的数据回来才能执行，这就是串行等待。v4 的 LDG.E 本身 stall 只有 0.25%，说明 load 指令本身发得很快、没有排队。
+- v2 的第一个 FMNMX stall 17.22%（还在等第一个 load），而后面三个 FMNMX stall 迅速降到 2.25%、1.38%、0.95%——因为 4 个 load 是连续发出的，第一个 load 等数据的时候，后面的 load 已经在路上了，并行返回。
 
 #### 多出来的 2.33 亿条指令是什么？
 

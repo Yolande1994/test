@@ -415,7 +415,6 @@ __global__ void softmax_forward_kernel5(float* out, const float* inp, int N, int
 |---|:---:|:---:|:---:|
 | v4 | 14.35 | 60.66 | 27.28 |
 | v5 | **10.56** | **85.06** | 36.26 |
-| 变化 | **快 26%** | +40% | +33% |
 
 8x 循环展开让编译器批量发射 load，计算合并省掉了一整趟全局内存读 exp 结果。Memory Throughput 从 60% 拉到 85%，DRAM 带宽进一步吃满。
 
@@ -434,10 +433,10 @@ __global__ void softmax_forward_kernel5(float* out, const float* inp, int N, int
 
 ![v4 vs v5 管线利用率对比](images/softmax8.png)
 
-| | v4 | v5 |
+| 指标 | LSU 管线利用率 | ALU Heavy 管线利用率 |
 |---|:---:|:---:|
-| LSU 管线利用率 | 27% | 33% |
-| ALU Heavy 管线利用率 | 22% | 30% |
+| v4 | 27% | 22% |
+| v5 | 33% | 30% |
 
 管线利用率的变化和 SASS 证据一致：v5 的访存管线更忙了——8 个 load 一起发，单位时间内搬运的数据更多。计算管线也更忙了——同样的计算量在更短时间里完成。
 

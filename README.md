@@ -444,7 +444,7 @@ __global__ void softmax_forward_kernel5(float* out, const float* inp, int N, int
 
 ### 版本定位
 
-这是**普通 softmax 的最优版本**。在不改变算法结构（遍历三趟全局内存）的前提下，通过循环展开、计算合并和流式访存，让带宽利用率靠近硬件极限。
+这是**普通 softmax 的最优版本**。在不改变算法结构（遍历三趟全局内存）的前提下，通过循环展开、计算合并和流式访存等，让带宽利用率靠近硬件极限。
 
 在寄存器压力范围内，通过调整循环展开因子的小大，或配合向量化访存技术，往往还能**进一步**压榨带宽。
 
@@ -509,7 +509,7 @@ float offset = shared[0];
 
 **结论：当两个 kernel 都被正确展开、带宽都吃满后，规约机制的差异对性能没有太多影响。** 规约只处理 block_size 个标量，在全局内存读写（50257 个值）面前占比极小，机制差异几乎被带宽瓶颈淹没。
 
->这也验证了末尾附录的结论：v4 比 v2 慢的原因是编译器没展开 v4，不是两级规约算法本身有问题。
+>这呼应了末尾附录的结论：v4 比 v2 慢的原因是编译器没展开 v4，不是两级规约算法本身有问题。
 
 <br>
 
@@ -517,9 +517,11 @@ float offset = shared[0];
 
 ## v6 — 在线 Softmax 朴素移植
 
-之前 v1~v5 是标准三趟法，需要把 exp 中间结果写回全局内存再读回来求 sum。
+### 设计思路
 
-v6 引入**在线 Softmax**（基于论文《Online normalizer calculation for softmax》），将"求最大值"和"求指数和"合并到一次遍历中：
+v1~v5 都是标准三趟法：先求 max，再求 exp 写回全局内存，再读回来求 sum。这意味着 exp 的中间结果必须经过一次全局内存往返。
+
+在线 Softmax（基于论文《Online normalizer calculation for softmax》）把"求最大值"和"求指数和"合并到一次遍历中。每读到一个新元素，就根据当前已知的最大值动态调整 sum：如果新元素更大，就把旧 sum 折算到新基准上。这样访存从 3 次降为 2 次（1 读输入 + 1 写输出）。
 
 ```cuda
 __global__ void online_softmax_forward_kernel6(float* out, const float* inp, int N, int C) {
@@ -528,8 +530,8 @@ __global__ void online_softmax_forward_kernel6(float* out, const float* inp, int
     const float* inp_row = inp + i * C;
     float* out_row = out + i * C;
 
-    // 一趟遍历同时求出全局最大值和指数总和
-    double sum = 0.0;  // 维度C很大时，双精度可显著提升数值稳定性
+    float maxval = -INFINITY;
+    double sum = 0.0;  // C 很大时，双精度累加可显著提升数值稳定性
     for (int j = 0; j < C; j++) {
         float maxval_prev = maxval;
         float current_val = inp_row[j];
@@ -537,7 +539,7 @@ __global__ void online_softmax_forward_kernel6(float* out, const float* inp, int
             maxval = current_val;
             sum = sum * expf(maxval_prev - maxval) + expf(current_val - maxval);
         } else {
-            sum = sum + expf(current_val - maxval);
+            sum += expf(current_val - maxval);
         }
     }
     for (int j = 0; j < C; j++)
@@ -545,26 +547,32 @@ __global__ void online_softmax_forward_kernel6(float* out, const float* inp, int
 }
 ```
 
-数学等价性：全程只有加法和乘法，没有大数相消误差。相比三趟法，访存从 3 次降为 2 次（1 读输入 + 1 写输出）。
+### 性能表现
+
+耗时 141.65ms——比 v1（105.91ms）还慢。访存量减少了，但性能反而下降了。
 
 ### 为什么省了一次访存反而更慢？
 
-v6 耗时 141.65ms，比 v1 还慢。**根因是 expf 落在了串行依赖链上**：
+根因是 **expf 落在了串行依赖链上**。看 v6 的核心循环：
 
 ```cuda
-sum = sum * expf(maxval - bigger) + expf(x[i] - bigger);  // 每次迭代都依赖上一次的 sum
+sum = sum * expf(maxval_prev - maxval) + expf(current_val - maxval);
 ```
 
-每一次迭代，`sum` 都要等上一次迭代的 `sum` 算完，而 `expf` 的延迟（约 20 个时钟周期）**完全落在串行链上**。对比 v1 的第二趟：
+每一次迭代，`sum` 都必须等上一次迭代的 `sum` 算完才能开始。而 `expf` 是一个延迟约 20 个时钟周期的函数，这个延迟完全暴露在串行链上。
+
+对比 v1 的第二趟：
 
 ```cuda
 out_row[j] = expf(inp_row[j] - maxval);  // expf 之间互相独立，可并行发射到 SFU
 sum += out_row[j];                       // sum 链上只有一次加法（约 4 周期）
 ```
 
-v1 里多个 `expf` 互相独立，可以并行发射；`sum` 的依赖链上只有加法。
+v1 里多个 `expf` 互相独立，可以并行发射到 SFU 流水线；`sum` 的依赖链上只有加法。v6 把 `expf` 的延迟强行串行化了——**用更多的计算延迟换更少的访存，在单线程模式下得不偿失**。此外，`if (current_val > maxval)` 这个数据相关分支在 Warp 内会产生分歧，进一步拖慢执行。
 
-v6 把 `expf` 的延迟强行串行化了——**用更多的计算延迟换更少的访存，在单线程模式下得不偿失**。（v6 里还存在数据依赖的分支（if current_val > maxval），在 Warp 内产生分歧，进一步拖慢执行。）
+### 版本定位
+
+这是**在线算法的基线版本**。它证明了两件事：在线 Softmax 不是银弹，减少访存量的收益必须有足够的并行度来兑现；单线程模式下 expf 的串行延迟会成为新的瓶颈。
 
 > v6 的价值是作为在线算法的基线，也证明了在线算法并非一定最优，最好配合足够的并行度来缩短串行链。
 
@@ -590,7 +598,7 @@ __device__ SumMax reduce_sum_max_op(SumMax a, SumMax b) {
 }
 ```
 
-v8 进一步用 `fmaxf` + 统一公式抹掉 v7 中的 if-else 分支：
+v8 进一步用 `fmaxf` + 统一公式抹掉 v7 中的 if-else 分支，让所有线程执行完全相同的指令流：
 
 ```cuda
 // v8 完整代码
@@ -647,7 +655,7 @@ __global__ void online_softmax_forward_kernel8(float* out, const float* inp, int
 | Compute (%) | 53.74 | 16.62 | 12.56 |
 | Memory (%) | 20.82 | 84.59 | 84.43 |
 
-从 v6 到 v7，耗时从 141.65ms 降到 15.20ms——9 倍提升。把 C 分摊到 32 个线程后，串行链缩短 32 倍，expf 延迟被完美隐藏。
+从 v6 到 v7，耗时从 141.65ms 降到 15.20ms——9 倍提升。把 C 分摊到 32 个线程后，串行链缩短 32 倍，expf 延迟被其他 Warp 充分隐藏。
 
 ### 为什么 v8 没有比 v7 更快？
 
@@ -672,7 +680,7 @@ v7/v8 的 Block 总数只有 v5 的 1/16，SM 上驻留的 Block 数不足。**M
 
 ## v9 — 在线 Softmax + 块级两级规约
 
-v7/v8 每行只用 32 个线程，在 C=50257 这样的大 C 下每线程仍要处理 1570 个元素。v9 改用「1 个 Block 处理 1 行」，用整个 Block 的线程分摊长通道遍历。
+v7/v8 每行只用 32 个线程，在 C=50257 这样的大 C 下每线程仍要处理 1570 个元素。v9 回归「1 个 Block 处理 1 行」，用整个 Block 的线程分摊长通道遍历。
 
 ```cuda
 __global__ void online_softmax_forward_kernel9(float* out, const float* inp, int N, int C) {

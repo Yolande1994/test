@@ -20,7 +20,7 @@ out    = exp(row - maxval) / sum   # 第三趟：归一化写回
 
 >数值稳定性：`exp(x)` 在 `x > 88` 时会上溢为 inf，因此先减去行内最大值再算指数，数学上等价，数值上稳定。
 
-**访存特征**：当 `C = 50257`（GPT-2 词表维度）时，总输入张量约 1.6 GB，超 L2 缓存容量；数据逐行处理无复用，且需遍历多趟，是典型的**访存受限型算子（Memory-Bound）**，优化核心是减少全局内存往返、提升访存合并度与带宽利用率。
+典型的**访存受限型算子（Memory-Bound）**。三趟遍历逐行读输入，每行数据只读一次无复用，计算量（max + exp + 除法）很少，核心优化目标是**减少全局内存往返、提升访存合并度与带宽利用率**。
 
 ---
 
@@ -521,7 +521,7 @@ float offset = shared[0];
 
 标准三趟法要求先知道整行最大值才能算 sum。
 
-在线 Softmax（基于论文《Online normalizer calculation for softmax》）的核心是：**边遍历边维护当前已知的 max 和 sum，遇到更大的值时把旧 sum 折算到新基准上。**
+**在线 Softmax**（基于论文《Online normalizer calculation for softmax》）的核心是：**边遍历边维护当前已知的 max 和 sum，遇到更大的值时把旧 sum 折算到新基准上。**
 
 假设已处理完前 $k$ 个元素，当前记录的最大值为 $m_k$，指数和为 $l_k = \sum_{i=1}^{k} e^{x_i - m_k}$。
 
@@ -549,18 +549,24 @@ __global__ void online_softmax_forward_kernel6(float* out, const float* inp, int
     const float* inp_row = inp + i * C;
     float* out_row = out + i * C;
 
-    float maxval = -INFINITY;
-    double sum = 0.0;  // C 很大时，双精度累加可显著提升数值稳定性
+    float maxval = -INFINITY;   // 当前已知的最大值
+    double sum = 0.0;           // 基于 maxval 的指数和（双精度累加保稳定）
+
+    // 一趟遍历：边读边维护 maxval 和 sum
     for (int j = 0; j < C; j++) {
         float maxval_prev = maxval;
         float current_val = inp_row[j];
         if (current_val > maxval) {
+            // 遇到更大的值：更新 max，旧 sum 乘 exp(旧max-新max) 折算到新基准
             maxval = current_val;
             sum = sum * expf(maxval_prev - maxval) + expf(current_val - maxval);
         } else {
+            // 没更大：直接累加
             sum += expf(current_val - maxval);
         }
     }
+
+    // 第二趟：归一化写回
     for (int j = 0; j < C; j++)
         out_row[j] = expf(inp_row[j] - maxval) / sum;
 }

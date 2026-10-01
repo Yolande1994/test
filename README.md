@@ -519,17 +519,22 @@ float offset = shared[0];
 
 ### 数学原理
 
-标准三趟法要求先知道整行最大值才能算 sum。在线 Softmax（基于论文《Online normalizer calculation for softmax》）的核心是：边遍历边维护当前已知的 max 和 sum，遇到更大的值时把旧 sum 折算到新基准上。
+标准三趟法要求先知道整行最大值才能算 sum。
 
-假设已处理完前 k 个元素，当前记录的最大值为 m_k，指数和为 l_k = Σ exp(x_i - m_k)。
+在线 Softmax（基于论文《Online normalizer calculation for softmax》）的核心是：**边遍历边维护当前已知的 max 和 sum，遇到更大的值时把旧 sum 折算到新基准上。**
 
-读到第 k+1 个元素 x 时：
+假设已处理完前 $k$ 个元素，当前记录的最大值为 $m_k$，指数和为 $l_k = \sum_{i=1}^{k} e^{x_i - m_k}$。
 
-1. 更新最大值：m_new = max(m_k, x)
-2. 折算旧 sum：l_k × exp(m_k - m_new)
-3. 累加新元素：l_new = l_k × exp(m_k - m_new) + exp(x - m_new)
+读到第 $k+1$ 个元素 $x_{k+1}$ 时：
 
-这样不需要提前知道整行最大值，一次遍历就能同时得到 max 和 sum。最后写回时用 exp(x_i - m) / l 归一化即可。
+1. 更新最大值： 
+    $m_{k+1}$ = max($m_k$, $x_{k+1}$)
+2. 折算旧 sum： 
+    $l_k$ × exp($m_k$ - $m_{k+1}$)
+3. 累加新元素： 
+    $l_{k+1}$ = $l_k$ × exp($m_k$ - $m_{k+1}$) + exp($x_{k+1}$ - $m_{k+1}$)
+
+这样不需要提前知道整行最大值，一次遍历就能同时得到 max 和 sum。最后写回时用 $e^{x_i - m} / l$ 归一化即可。
 
 ### 设计思路
 

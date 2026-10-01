@@ -846,7 +846,7 @@ Long Scoreboard stall 是"等 load 数据从 DRAM 回来"的时间占比。v2 �
 
 **v2 的主循环被 nvcc 自动 4 倍展开了，v4 的主循环完全没有展开。**
 
-#### v2 的主循环（max 遍历）
+#### v2 的主循环（遍历求 max）
 
 ![v2 max 循环 SASS 截图](images/softmax5.png)
 
@@ -875,7 +875,7 @@ FMNMX.FTZ R13, R13, R10        # max with load 4
 
 exp 循环、sum 循环、normalize 循环全部同样是 4 倍展开。
 
-#### v4 的主循环（max 遍历）
+#### v4 的主循环（遍历求 max）
 
 ![v4 max 循环 SASS 截图](images/softmax6.png)
 
@@ -909,12 +909,21 @@ v4 的 DRAM 有大量空闲缝隙：发完一个 load，要算地址、加计数
 
 上图中的 Warp Stall Sampling 数据可以验证：
 
-- v4 的 FMNMX（取 max）指令 stall 高达 **40.57%**——它必须等 LDG 的数据回来才能执行，这就是串行等待。v4 的 LDG.E 本身 stall 只有 0.25%，说明 load 指令发得很快、没有排队。
-- v2 的第一个 FMNMX stall 17.22%（等第一个 load），而后面三个 FMNMX stall 迅速降到 2.25%、1.38%、0.95%——因为 4 个 load 是连续发出的，第一个 load 等数据的时候，后面的 load 也在路上，并行返回。
+- v4 的 FMNMX（取 max）指令 stall 高达 **40.57%**——它必须等 LDG 的数据回来才能执行，这就是串行等待。v4 的 LDG.E 本身 stall 只有 0.25%，说明 load 指令发得很快、不是瓶颈。
+- v2 的第一个 FMNMX stall 17.22%（等第一个 load），而后面三个 FMNMX stall 迅速降到 2.25%、1.38%、0.95%——因为 4 个 load 是连续发出的，第一个 load 等数据的时候，后面的 load 紧跟其后，并行返回。
 
 ### 为什么编译器展开了 v2 却没展开 v4？
 
 一顿排查后定位到原因：v4 的循环条件里直接用了 `blockDim.x`，改成 `int block_size = blockDim.x;` 之后，编译器就像 v2 一样自动展开了。
+
+```cuda
+// 原来：
+for (int i = tid; i < C; i += blockDim.x) {}
+
+// 改成：
+int block_size = blockDim.x;
+for (int i = tid; i < C; i += block_size) {}
+```
 
 `blockDim.x` 是运行时传入的值，nvcc 在看到循环边界依赖一个动态值时，会保守地不做循环展开。把它赋给一个局部变量后，编译器能更好地分析循环迭代次数，触发自动展开。
 

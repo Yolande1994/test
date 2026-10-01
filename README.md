@@ -519,26 +519,23 @@ float offset = shared[0];
 
 ### 数学原理
 
-标准三趟法要求先知道整行最大值才能算 sum。在线 Softmax 的核心是：**边遍历边维护当前已知的 max 和 sum，遇到更大的值时把旧 sum 折算到新基准上。**
+标准三趟法要求先知道整行最大值才能算 sum。在线 Softmax（基于论文《Online normalizer calculation for softmax》）的核心是：边遍历边维护当前已知的 max 和 sum，遇到更大的值时把旧 sum 折算到新基准上。
 
-假设已处理完前 $k$ 个元素，当前记录的最大值为 $m_k$，指数和为 $l_k = \sum_{i=1}^{k} e^{x_i - m_k}$。
+假设已处理完前 k 个元素，当前记录的最大值为 m_k，指数和为 l_k = Σ exp(x_i - m_k)。
 
-读到第 $k+1$ 个元素 $x_{k+1}$ 时：
+读到第 k+1 个元素 x 时：
 
-1. 更新最大值： 
-    $m_{k+1}$ = max($m_k$, $x_{k+1}$)
-2. 折算旧 sum： 
-    $l_k$ × exp($m_k$ - $m_{k+1}$)
-3. 累加新元素： 
-    $l_{k+1}$ = $l_k$ × exp($m_k$ - $m_{k+1}$) + exp($x_{k+1}$ - $m_{k+1}$)
+1. 更新最大值：m_new = max(m_k, x)
+2. 折算旧 sum：l_k × exp(m_k - m_new)
+3. 累加新元素：l_new = l_k × exp(m_k - m_new) + exp(x - m_new)
 
-这样不需要提前知道整行最大值，一次遍历就能同时得到 max 和 sum。最后写回时用 $e^{x_i - m} / l$ 归一化即可。
+这样不需要提前知道整行最大值，一次遍历就能同时得到 max 和 sum。最后写回时用 exp(x_i - m) / l 归一化即可。
 
 ### 设计思路
 
-v1~v5 都是标准三趟法：先求 max，再求 exp 写回全局内存，再读回来求 sum。这意味着 exp 的中间结果必须经过一次全局内存往返。
+v1~v5 的三趟法要求 exp 的中间结果先写全局内存、再读回来求 sum，多一次全局内存往返。
 
-在线 Softmax（基于论文《Online normalizer calculation for softmax》）把"求最大值"和"求指数和"合并到一次遍历中。每读到一个新元素，就根据当前已知的最大值动态调整 sum：如果新元素更大，就把旧 sum 折算到新基准上。这样访存从 3 次降为 2 次（1 读输入 + 1 写输出）。
+在线 Softmax 的工程价值在于：利用上面的递推式，把"求 max"和"求 sum"合并到同一次输入遍历中，省去了 exp 中间结果的全局内存读写。访存从 3 次（读输入求 max、读输入算 exp 写回、读 exp 求 sum）降为 2 次（读输入边遍历边算、写输出归一化）。
 
 ```cuda
 __global__ void online_softmax_forward_kernel6(float* out, const float* inp, int N, int C) {

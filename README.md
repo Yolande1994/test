@@ -802,14 +802,19 @@ __global__ void online_softmax_forward_kernel9(float* out, const float* inp, int
 | v7/v8 | 15.20 | 16.62 | 84.59 | 512 |
 | v9 | **10.86** | 26.44 | 80.09 | 8192 |
 
-相比 v7/v8，v9 耗时降低约 28%，主要来自两点（以 block_size = 512 为例）：
+相比 v7/v8，v9 耗时降低约 28%，主要来自两点（以 block_size = 512 为尺）：
 
 1. **串行链缩短 16 倍**：每线程处理的元素从 1570 个降到 98 个，expf 的串行依赖被大幅压缩
 2. **Grid Size 扩大 16 倍**：从 512 个 Block 增加到 8192 个，SM 全部被填满
 
 >v9 的 Memory Throughput（80.09%）比 v7/v8（84.59%）略低，但总耗时反而更短——说明带宽百分比不能单独决定性能，Grid Size 和 Occupancy 同样关键。
 
-v9 目前没有做循环展开和向量化访存。在线 Softmax 主循环里 sumval 是串行累加，展开后只能批量发出 load 指令，reduce_sum_max_op 仍需串行执行，收益不如 v5 直接。
+>**Tips：**
+>- **Grid 打满** = 所有 SM 都有活干（总量问题，是否有足够多的 Block 让 GPU 上每个 SM 都能分到任务）
+>- **Occupancy 高** = 每个 SM 上 Warp 足够多（密度问题，单个 SM 上能不能同时驻留最多的 Warp）
+>- 两个都要满足。Grid 不够 → 部分 SM 空闲；Occupancy 不够 → SM 上 Warp 太少，延迟暴露。
+
+v9 目前没有做循环展开和向量化访存。在线 Softmax 主循环里的 sumval 是串行累加，展开后只能批量发出 load 指令，reduce_sum_max_op 部分仍需串行执行，收益不如 v5 直接。
 
 <br>
 

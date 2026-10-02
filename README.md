@@ -812,7 +812,7 @@ __global__ void online_softmax_forward_kernel9(float* out, const float* inp, int
 >**Tips：**
 >- **Grid 打满** = 所有 SM 都有活干（总量问题，是否有足够多的 Block 让 GPU 上每个 SM 都能分到任务）
 >- **Occupancy 高** = 每个 SM 上 Warp 足够多（密度问题，单个 SM 上能不能同时驻留最多的 Warp）
->- 两个都要满足。Grid 不够 → 部分 SM 空闲；Occupancy 不够 → SM 上 Warp 太少，延迟暴露。
+>- 两个都要满足。Grid 不够 → 部分 SM 空闲；Occupancy 不够 → SM 上可切换 Warp 太少，延迟暴露。
 
 v9 目前没有做循环展开和向量化访存。在线 Softmax 主循环里的 sumval 是串行累加，展开后只能批量发出 load 指令，reduce_sum_max_op 部分仍需串行执行，收益不如 v5 直接。
 
@@ -820,7 +820,7 @@ v9 目前没有做循环展开和向量化访存。在线 Softmax 主循环里�
 
 ## 在线 Softmax 的真正价值：Flash Attention
 
-独立算子性能测试里，v9（两趟法）和 v5（三趟法）耗时基本持平，但独立算子的场景不能体现它的核心作用——**在线 Softmax 是 Flash Attention 能成立的数学前提。**
+独立算子性能测试里，v9（两趟法）和 v5（三趟法）耗时基本持平，但独立算子的场景不能体现它的核心作用，那就是：**在线 Softmax 是 Flash Attention 能成立的数学前提。**
 
 ### 为什么标准三趟法在 Flash Attention 里行不通
 

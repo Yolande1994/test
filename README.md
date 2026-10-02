@@ -833,7 +833,7 @@ Flash Attention 解决的问题是：当序列长度 T 很大时，整个分数�
 2. 再读完整行，算 exp 并求和
 3. 再读完整行，归一化
 
-但在 Flash Attention 场景下，"整行"根本不在 SRAM 里——每读一个 K/V 块，处理完就丢弃，下一个块要从 HBM 重新拉。三趟法意味着每个 K/V 块要在 HBM 里往返三次，不符合 Flash Attention 减少访存的功能。
+但在 Flash Attention 场景下，"整行"根本不在 SRAM 里，而是被切成了分块——每读一个 K/V 块，处理完就丢弃，下一块从 HBM 重新拉。三趟法意味着每个 K/V 块要在 HBM 里往返三次，不符合 Flash Attention 减少访存的设计哲学。
 
 ### 在线 Softmax 如何让 Flash Attention 成立
 

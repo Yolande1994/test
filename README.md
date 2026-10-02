@@ -358,7 +358,7 @@ __global__ void softmax_forward_kernel5(float* out, const float* inp, int N, int
     const float* x = inp + bid * C;
     float* y = out + bid * C;
 
-    // ----- 第一趟：求最大值（8x 展开 + min 钳位）-----
+    // ----- 第一趟：求最大值（8 倍循环展开 + min 地址钳位）-----
     float maxval = -INFINITY;
     for (int i = tid; i < C; i += blockDim.x * UNROLL_FACTOR) {
         #pragma unroll
@@ -370,10 +370,12 @@ __global__ void softmax_forward_kernel5(float* out, const float* inp, int N, int
     maxval = warpReduceMax(maxval);  // v4 的两级规约
     if (laneId == 0) maxvals[warpId] = maxval;
     __syncthreads();
+    // 跨 Warp 合并
     if (tid == 0) {
         float val = maxvals[0];
         #pragma unroll
-        for (int i = 1; i < warpsPerBlock; i++) val = fmaxf(val, maxvals[i]);
+        for (int i = 1; i < warpsPerBlock; i++) 
+            val = fmaxf(val, maxvals[i]);
         maxvals[0] = val;
     }
     __syncthreads();
@@ -397,20 +399,21 @@ __global__ void softmax_forward_kernel5(float* out, const float* inp, int N, int
             }
         }
     }
-    // 规约 sumval（和 maxval 同样的两级规约）
+    // sumval 的两级规约（和 maxval 一样）
     sumval = warpReduceSum(sumval);
     if (laneId == 0) sumvals[warpId] = sumval;
     __syncthreads();
     if (tid == 0) {
         float val = sumvals[0];
         #pragma unroll
-        for (int i = 1; i < warpsPerBlock; i++) val += sumvals[i];
+        for (int i = 1; i < warpsPerBlock; i++) 
+            val += sumvals[i];
         sumvals[0] = val;
     }
     __syncthreads();
     float sum = sumvals[0];
     
-    // ----- 第三趟：归一化写回（8x 展开 + 读写分离）-----
+    // ----- 第三趟：归一化写回（8x 展开 + 读写分离：计算时间掩盖访存延迟）-----
     for (int i = tid; i < C; i += blockDim.x * UNROLL_FACTOR) {
         float reg_array[UNROLL_FACTOR];
         // 优化点6：先批量加载到寄存器

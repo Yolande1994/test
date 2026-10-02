@@ -92,7 +92,7 @@ __global__ void softmax_forward_kernel1(float* out, const float* inp, int N, int
 2. **访存不合并**：相邻线程处理的行地址间隔 `C=50257` 个元素，Warp 内 32 个线程访问完全离散的地址，带宽利用率极低。
 3. **长串行依赖**：单线程串行跑 5 万次循环，单线程内部强数据依赖，Warp 内部指令无法并行（ILP 难展开），无法靠指令级并行隐藏循环延迟。
 
-> Compute Throughput 只有 12.43%，Memory Throughput 也只有 54.60%——既没吃满算力，也没吃满带宽。
+> Compute Throughput 只有 9.58%，Memory Throughput 也只有 45.84%——既没吃满算力，也没吃满带宽。
 
 <br>
 
@@ -116,39 +116,40 @@ __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int
     extern __shared__ float shared[];
     int bid = blockIdx.x;
     int tid = threadIdx.x;
+    int block_size = blockDim.x;
     const float* x = inp + bid * C;
 
     // 一、求最大值（共同分摊 + 共享内存二分规约）
     float maxval = -INFINITY;
-    for (int i = tid; i < C; i += blockDim.x)
+    for (int i = tid; i < C; i += block_size)
         maxval = fmaxf(maxval, x[i]);
     shared[tid] = maxval;
     __syncthreads();
-    for (int stride = blockDim.x / 2; stride >= 1; stride /= 2) {
+    for (int stride = block_size / 2; stride >= 1; stride /= 2) {
         if (tid < stride) shared[tid] = fmaxf(shared[tid], shared[tid + stride]);
         __syncthreads();
     }
     float offset = shared[0];
 
     // 二、计算指数并写回
-    for (int i = tid; i < C; i += blockDim.x)
+    for (int i = tid; i < C; i += block_size)
         out[bid * C + i] = expf(x[i] - offset);
     __syncthreads();
 
     // 三、求指数和（复用共享内存 + 二分规约）
     float sumval = 0.0f;
-    for (int i = tid; i < C; i += blockDim.x)
+    for (int i = tid; i < C; i += block_size)
         sumval += out[bid * C + i];
     shared[tid] = sumval;
     __syncthreads();
-    for (int stride = blockDim.x / 2; stride >= 1; stride /= 2) {
+    for (int stride = block_size / 2; stride >= 1; stride /= 2) {
         if (tid < stride) shared[tid] += shared[tid + stride];
         __syncthreads();
     }
     float sum = shared[0];
 
     // 四、归一化写回
-    for (int i = tid; i < C; i += blockDim.x)
+    for (int i = tid; i < C; i += block_size)
         out[bid * C + i] = out[bid * C + i] / sum;
 }
 ```
@@ -239,11 +240,11 @@ __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int
 
    SM 能同时驻留的 Block 数量有硬件上限。v3 每个 Block 只含 1 个 Warp，即使 Block 数达到硬件上限时，SM 上的 Warp 总数也只能到最大值的一半（实测 Occupancy 仅 50%，SM 的 warp slot 有一半空着）。
 
-3. **两者叠加 → 访存延迟无法隐藏**
+3. **两者叠加 → 延迟无法隐藏**
 
-   GPU 隐藏访存延迟的手段是：一个 Warp 等内存时，SM 切换到另一个就绪 Warp 继续执行。
+   GPU 隐藏延迟的手段是：一个 Warp 等内存时，SM 切换到另一个就绪 Warp 继续执行。
 
-   v3 同时存在两个问题：活跃 Warp 总数只有 v2 的一半（第 2 点），且每个 Warp 的串行链又长 16 倍（第 1 点）。遇到访存时既没有足够多的其他 Warp 可切换，单个 Warp 内部也没有足够的独立指令来重叠，内存延迟暴露，带宽利用率只有 57%。
+   v3 同时存在两个问题：活跃 Warp 总数只有 v2 的一半（第 2 点），且每个 Warp 的串行链又长 16 倍（第 1 点）。访存或计算时既没有足够多的其他 Warp 可切换，单个 Warp 内部也没有足够的独立指令来重叠，内存延迟暴露。
 
 ### 版本定位
 
@@ -337,32 +338,42 @@ v4 还有三个可优化的点：循环控制指令多、exp 结果写了又读�
 
 ```cuda
 __global__ void softmax_forward_kernel5(float* out, const float* inp, int N, int C) {
-    // 优化点3：共享内存分区，max/sum 各一段
-    __shared__ float maxvals[WARPS_PER_BLOCK];
-    __shared__ float sumvals[WARPS_PER_BLOCK];
+    const int UNROLL_FACTOR = 8;  // 优化点1：循环展开因子
+    const int warpsPerBlock = blockDim.x / 32;
 
+    // 优化点3：共享内存分区，max/sum 各一段
+    extern __shared__ float shared[];
+    float* maxvals = shared;
+    float* sumvals = &shared[warpsPerBlock];
+
+    int bid = blockIdx.x;
     int tid = threadIdx.x;
     int warpId = tid / 32, laneId = tid % 32;
-    const float* x = inp + blockIdx.x * C;
-    float* y = out + blockIdx.x * C;
+    // 越界线程兜底：写入规约初始值后退出
+    if (tid >= C) {
+        maxvals[warpId] = -INFINITY;
+        sumvals[warpId] = 0.0f;
+        return;
+    }
+    const float* x = inp + bid * C;
+    float* y = out + bid * C;
 
-    // ----- 第一趟：求最大值（8x 展开）-----
+    // ----- 第一趟：求最大值（8x 展开 + min 钳位）-----
     float maxval = -INFINITY;
-    for (int i = tid; i < C; i += blockDim.x * 8) {
-        float reg[8];
+    for (int i = tid; i < C; i += blockDim.x * UNROLL_FACTOR) {
         #pragma unroll
-        for (int u = 0; u < 8; u++)
-            reg[u] = __ldcs(&x[min(C-1, i + u * blockDim.x)]);  // 优化点4+5
-        #pragma unroll
-        for (int u = 0; u < 8; u++)
-            maxval = fmaxf(maxval, reg[u]);
+        for (int u = 0; u < UNROLL_FACTOR; u++) {
+            // 优化点5：读操作只做 min 钳位，越界索引卡到最后一个元素，重复读不影响最大值
+            maxval = fmaxf(maxval, x[min(C - 1, i + u * blockDim.x)]);
+        }
     }
     maxval = warpReduceMax(maxval);  // v4 的两级规约
     if (laneId == 0) maxvals[warpId] = maxval;
     __syncthreads();
     if (tid == 0) {
         float val = maxvals[0];
-        for (int i = 1; i < WARPS_PER_BLOCK; i++) val = fmaxf(val, maxvals[i]);
+        #pragma unroll
+        for (int i = 1; i < warpsPerBlock; i++) val = fmaxf(val, maxvals[i]);
         maxvals[0] = val;
     }
     __syncthreads();
@@ -370,16 +381,16 @@ __global__ void softmax_forward_kernel5(float* out, const float* inp, int N, int
 
     // ----- 第二趟：exp + 写回 + 寄存器内局部求和（三合一）-----
     float sumval = 0.0f;
-    for (int i = tid; i < C; i += blockDim.x * 8) {
-        float reg_array[8];
-        // 优化点6：先批量加载到寄存器
+    for (int i = tid; i < C; i += blockDim.x * UNROLL_FACTOR) {
+        float reg_array[UNROLL_FACTOR];
+        // 优化点4+6：__ldcs 流式加载到寄存器，先批量读、不污染缓存
         #pragma unroll
-        for (int u = 0; u < 8; u++)
-            reg_array[u] = __ldcs(&x[min(C-1, i + u * blockDim.x)]);
+        for (int u = 0; u < UNROLL_FACTOR; u++)
+            reg_array[u] = __ldcs(&x[min(C - 1, i + u * blockDim.x)]);
         // 优化点2：批量计算、写回、寄存器内累加（省一趟全局读）
         #pragma unroll
-        for (int u = 0; u < 8; u++) {
-            if (i + u * blockDim.x < C) {
+        for (int u = 0; u < UNROLL_FACTOR; u++) {
+            if (i + u * blockDim.x < C) {   // 写操作必须严格判断越界
                 float output = expf(reg_array[u] - offset);
                 y[i + u * blockDim.x] = output;
                 sumval += output;
@@ -392,18 +403,25 @@ __global__ void softmax_forward_kernel5(float* out, const float* inp, int N, int
     __syncthreads();
     if (tid == 0) {
         float val = sumvals[0];
-        for (int i = 1; i < WARPS_PER_BLOCK; i++) val += sumvals[i];
+        #pragma unroll
+        for (int i = 1; i < warpsPerBlock; i++) val += sumvals[i];
         sumvals[0] = val;
     }
     __syncthreads();
-    float total_sum = sumvals[0];
-
-    // ----- 第三趟：归一化（8x 展开）-----
-    for (int i = tid; i < C; i += blockDim.x * 8) {
+    float sum = sumvals[0];
+    
+    // ----- 第三趟：归一化写回（8x 展开 + 读写分离）-----
+    for (int i = tid; i < C; i += blockDim.x * UNROLL_FACTOR) {
+        float reg_array[UNROLL_FACTOR];
+        // 优化点6：先批量加载到寄存器
         #pragma unroll
-        for (int u = 0; u < 8; u++) {
-            int idx = i + u * blockDim.x;
-            if (idx < C) y[idx] /= total_sum;
+        for (int u = 0; u < UNROLL_FACTOR; u++)
+            reg_array[u] = y[min(C - 1, i + u * blockDim.x)];
+        // 再集中计算、写回
+        #pragma unroll
+        for (int u = 0; u < UNROLL_FACTOR; u++) {
+            if (i + u * blockDim.x < C)
+                y[i + u * blockDim.x] = reg_array[u] / sum;
         }
     }
 }
@@ -446,13 +464,15 @@ __global__ void softmax_forward_kernel5(float* out, const float* inp, int N, int
 
 这是**普通 softmax 的最优版本**。在不改变算法结构（遍历三趟全局内存）的前提下，通过循环展开、计算合并和流式访存等，让带宽利用率靠近硬件极限。
 
-在寄存器压力范围内，通过调整循环展开因子的小大，或配合向量化访存技术，往往还能**进一步**压榨带宽。
+在寄存器压力范围内，通过调整循环展开因子的大小，或配合向量化访存技术，往往还能**进一步**压榨带宽。
 
 <br>
 
 ---
 
-## 额外对比实验：v10 — 二分规约 vs 两级规约
+## 额外对比实验： 二分规约 vs 两级规约
+
+为做测试对照实验，写了 v10 版本，因为用的是重复的架构，没有新意，因此未收录在源码 `softmax_forward.cu` 中，仅记录结论。
 
 v5 用的是 v4 的**两级规约**骨架（Warp Shuffle + 跨 Warp 共享内存）。
 
@@ -855,7 +875,7 @@ O = O / l
 
 这里的 `exp(m - m_new)` 就是在线 Softmax 的折算项：当读入新的 K/V 块后，如果发现了更大的分数，之前所有块的 exp 和输出都要按比例缩小到新基准上。
 
-正因为有了这个折算机制，每个 K/V 块**只需要从 HBM 读一次、写一次**，不需要在 HBM 里反复往返。Flash Attention 由此把标准注意力的峰值显存占用从 O(N²)（存储完整注意力矩阵）降到 O(N)（只存 Q/K/V/输出），HBM 访存量从 O(N²) 降到 O(N²/M)（M 为 K/V 块大小）。
+正因为有了这个折算机制，每个 K/V 块**只需要从 HBM 读一次、写一次**，不需要在 HBM 里反复往返。Flash Attention 由此把标准注意力的峰值显存占用从 O(T²)（存储完整注意力矩阵）降到 O(T)（只存 Q/K/V/输出），HBM 访存量从 O(T²) 降到 O(T²/M)（M 为 K/V 块大小）。
 
 >**关于 Flash Attention 的原理和代码实现，可见本仓库的 attention 目录**
 

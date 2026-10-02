@@ -367,7 +367,7 @@ __global__ void softmax_forward_kernel5(float* out, const float* inp, int N, int
             maxval = fmaxf(maxval, x[min(C - 1, i + u * blockDim.x)]);
         }
     }
-    maxval = warpReduceMax(maxval);  // v4 的两级规约
+    maxval = warpReduceMax(maxval);  // Warp 内 Shuffle 规约
     if (laneId == 0) maxvals[warpId] = maxval;
     __syncthreads();
     // 跨 Warp 合并
@@ -399,7 +399,7 @@ __global__ void softmax_forward_kernel5(float* out, const float* inp, int N, int
             }
         }
     }
-    // sumval 的两级规约（和 maxval 一样）
+    // 规约 sumval（和 maxval 同样的两级规约）
     sumval = warpReduceSum(sumval);
     if (laneId == 0) sumvals[warpId] = sumval;
     __syncthreads();

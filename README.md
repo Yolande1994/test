@@ -843,7 +843,7 @@ Flash Attention 对每个 Q tile 维护一个运行状态 (m, l, O)，每读一�
 m = -inf, l = 0, O = 0
 
 for 每个 K/V tile：
-    S = Q @ K_tile^T                  # 当前块的注意力分数
+    S = Q @ K_tileᵀ                   # 当前块的注意力分数
     m_new = max(m, rowmax(S))         # 更新最大值
     P = exp(S - m_new)                # 当前块的概率
     l = l * exp(m - m_new) + rowsum(P)        # 指数和折算到新基准
@@ -906,7 +906,7 @@ v10 (10.33ms)  v2 二分规约的骨架 + v5 的全部优化 = 证明规约机�
 
 ## 后续优化方向
 
-**算子融合——Flash Attention**：Softmax 天然位于 `Q@K^T` 和 `@V` 之间。将三者融合在 SRAM 中完成，可彻底消除注意力分数矩阵的全局内存往返。详见仓库中 attention 目录。
+**算子融合——Flash Attention**：Softmax 天然位于 `Q@Kᵀ` 和 `@V` 之间。将三者融合在 SRAM 中完成，可彻底消除注意力分数矩阵的全局内存往返。详见仓库中 attention 目录。
 
 <br>
 <br>

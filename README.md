@@ -584,18 +584,18 @@ __global__ void online_softmax_forward_kernel6(float* out, const float* inp, int
 sum = sum * expf(maxval_prev - maxval) + expf(current_val - maxval);
 ```
 
-`sum` 是一个累加器，每次循环迭代都必须等待上一次的 `sum` 完全计算完毕。这就形成了一个贯穿整个 C=50257 次循环的单链串行依赖。而 `expf` 是一个高延迟的函数，这个延迟完全暴露在串行链上。
+`sum` 是一个累加器，每次循环迭代都必须等上一次的 `sum` 完全计算完毕，这就形成了一个贯穿整个 C=50257 次循环的单链串行依赖。而 `expf` 是一个高延迟的函数，这个延迟完全暴露在串行链上。
 
 对比 v1 的第二趟：
 
 ```cuda
 out_row[j] = expf(inp_row[j] - maxval);  // expf 之间互相独立，可并行发射到 SFU
-sum += out_row[j];                       // 依赖链极短（1 次加法约 4 周期）
+sum += out_row[j];                       // 依赖链极短（1 次加法仅约 4 周期）
 ```
 
 v1 里多个 `expf` 互相独立没有依赖，可以启动指令级并行（ILP），并行发射到 SFU 流水线；
 
-虽然 `sum += out_row[j]` 也是串行，但加法指令延迟很低，且 `sum` 依赖的是上一个 `expf` 的结果，不阻塞新的 `expf` 发射。
+虽然 `sum += out_row[j]` 也是串行，但加法指令延迟很低，且 `sum` 依赖的是上一个 `expf` 的结果，不会阻塞新的 `expf` 发射。
 
 此外，`if (current_val > maxval)` 分支判断在 Warp 内会产生控制发散，Warp 被迫串行执行两个分支，进一步拖慢速度。
 
@@ -607,88 +607,96 @@ v1 里多个 `expf` 互相独立没有依赖，可以启动指令级并行（ILP
 
 ## v7 / v8 — 在线 Softmax 的 Warp 级并行
 
-v6 的问题是每线程串行遍历 C 次。v7 改为**一个 Warp 处理一行**，32 个线程分摊 C 个元素，每线程处理 C/32 个元素，串行链缩短 32 倍。
+v6 的问题是每线程串行遍历 C 次。v7/v8 改为**一个 Warp 处理一行**，32 个线程分摊 C 个元素，串行链缩短 32 倍。
 
-核心数据结构 `SumMax` 把"局部最大值"和"基于该最大值的指数和"打包成 8 字节对齐结构体，通过 shuffle 一次性交换：
+#### 工具函数
+
+在线 Softmax 规约时，每个线程局部维护两个值：自己看到的最大值，和基于这个最大值算出的指数和。两个线程的 max 不同，sum 不能直接相加，合并时要把较小基准下的 sum 折算到较大基准上。
+
+`SumMax` 就是把这两个值打包成 8 字节结构体，方便通过一次 shuffle 同时交换；
+
+`reduce_sum_max_op` 负责把两个 SumMax 合并成一个，逻辑和在线递推公式一致：
 
 ```cuda
-struct __align__(8) SumMax { float maxval; float sum; };
+struct __align__(8) SumMax {
+    float maxval;  // 局部最大值
+    float sum;     // 基于该最大值的指数和
+};
 
 __device__ SumMax reduce_sum_max_op(SumMax a, SumMax b) {
-    // 选更大的 max 作为基准，较小基准下的 sum 折算过来
-    float bigger = fmaxf(a.maxval, b.maxval);
-    float sum = (a.maxval == bigger ? a.sum : a.sum * expf(a.maxval - bigger))
-              + (b.maxval == bigger ? b.sum : b.sum * expf(b.maxval - bigger));
-    return {bigger, sum};
+    float bigger = fmaxf(a.maxval, b.maxval);  // 选更大的作为新基准
+    // a.sum 是基于 a.maxval 算的，如果 a.maxval 不是更大的那个，就要折算
+    float sum_a = (a.maxval == bigger) ? a.sum : a.sum * expf(a.maxval - bigger);
+    float sum_b = (b.maxval == bigger) ? b.sum : b.sum * expf(b.maxval - bigger);
+    return {bigger, sum_a + sum_b};
 }
+// 举例：线程 A 看到 max=3、sum=5；线程 B 看到 max=5、sum=2。合并后基准变成 5，A 的 sum 要乘 exp (3-5) 折算，再加 B 的 sum。
 ```
 
-v8 进一步用 `fmaxf` + 统一公式抹掉 v7 中的 if-else 分支，让所有线程执行完全相同的指令流：
+### v7 的实现
+
+v7 用 cooperative groups 做 Warp 内规约，每个线程先遍历自己负责的元素，累积成一个 SumMax，然后 Warp 内两两合并：
 
 ```cuda
-// v8 完整代码
-__global__ void online_softmax_forward_kernel8(float* out, const float* inp, int N, int C) {
-    const int warpsPerBlock = blockDim.x / warpSize;
-    int tid = threadIdx.x;
-    if (tid >= C) { return; }
-    int warpId = tid / warpSize;
-    int laneId = tid % warpSize;
-    int row = blockIdx.x * warpsPerBlock + warpId;
-    if (row >= N) { return; }
-
+__global__ void online_softmax_forward_kernel7(float* out, const float* inp, int N, int C) {
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    int row = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    if (row >= N) return;
     const float* x = inp + row * C;
-    float* const y = out + row * C;
 
-    // v8 核心循环：无分支写法
-    // 单趟循环同时维护 maxval 和 sumval
-    float maxval = -INFINITY, sumval = 0.0f, bigger;
-    for (int i = laneId; i < C; i += warpSize) {
-        bigger = fmaxf(maxval, x[i]);
-        sumval = sumval * expf(maxval - bigger) + expf(x[i] - bigger);
-        maxval = bigger;
-    }
+    // 每线程维护局部 SumMax，逐个元素合并
+    SumMax sm_partial = {-INFINITY, 0.0f};
+    for (int i = warp.thread_rank(); i < C; i += warp.size())
+        sm_partial = reduce_sum_max_op(sm_partial, {x[i], 1.0f});
 
-    // Warp 内两两合并（基于 SumMax 结构的两级规约语义）
-    float offsetMaxval, offsetSumval;
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-        __syncwarp();
-        offsetMaxval = __shfl_down_sync(0xFFFFFFFF, maxval, offset);
-        offsetSumval = __shfl_down_sync(0xFFFFFFFF, sumval, offset);
-        if (offsetMaxval > maxval) {
-            sumval *= expf(maxval - offsetMaxval);
-            maxval = offsetMaxval;
-        } else {
-            offsetSumval *= expf(offsetMaxval - maxval);
-        }
-        sumval += offsetSumval;
-    }
-    // 广播最终结果（向下规约后只有 lane 0 持有完整值，所以每个线程都读取 lane 0 的值）
-    maxval = __shfl_sync(0xFFFFFFFF, maxval, 0);
-    sumval = __shfl_sync(0xFFFFFFFF, sumval, 0);
+    // Warp 内规约：32 个 SumMax 合并成一个
+    SumMax sm_total = cg::reduce(warp, sm_partial, reduce_sum_max_op);
 
-    for (int i = laneId; i < C; i += warpSize) {
-        y[i] = expf(x[i] - maxval) / sumval;
-    }
+    // 归一化写回
+    for (int i = warp.thread_rank(); i < C; i += warp.size())
+        out[row * C + i] = expf(x[i] - sm_total.maxval) / sm_total.sum;
 }
 ```
 
-### 效果
+注意一个 Block 内可以放多个 Warp，每个 Warp 各处理一行——所以 Grid Size = N / warpsPerBlock，比 v6 的一个线程一行并行度高了 32 倍。
 
-| 指标 | v6 | v7 | v8 |
+### v8：无分支优化
+
+v7 的循环里有一个 `if (current_val > maxval)` 分支：遇到更大的值才更新 max。这个分支在 Warp 内会导致线程发散——一部分线程走 if、一部分走 else，GPU 要串行执行两路指令。
+
+v8 用 `fmaxf` 抹掉分支，所有线程执行完全相同的指令：
+
+```cuda
+float maxval = -INFINITY, sumval = 0.0f;
+for (int i = laneId; i < C; i += warpSize) {
+    float bigger = fmaxf(maxval, x[i]);
+    sumval = sumval * expf(maxval - bigger) + expf(x[i] - bigger);
+    maxval = bigger;
+}
+```
+
+不管新元素是不是更大，都统一走这条公式。当 `new <= old` 时，`bigger = old`，`exp(old - old) = 1`，公式退化成普通累加，结果正确但不需要分支。
+
+### 性能表现
+
+| 版本 | 耗时 (ms) | Compute (%) | Memory (%) |
 |---|:---:|:---:|:---:|
-| 耗时 (ms) | 141.65 | 15.20 | 15.22 |
-| Compute (%) | 53.74 | 16.62 | 12.56 |
-| Memory (%) | 20.82 | 84.59 | 84.43 |
+| v6 | 141.65 | 53.74 | 20.82 |
+| v7 | 15.20 | 16.62 | 84.59 |
+| v8 | 15.22 | 12.56 | 84.43 |
 
-从 v6 到 v7，耗时从 141.65ms 降到 15.20ms——9 倍提升。把 C 分摊到 32 个线程后，串行链缩短 32 倍，expf 延迟被其他 Warp 充分隐藏。
+从 v6 到 v7，串行链缩短 32 倍，expf 延迟被其他 Warp 掩盖，耗时降 9 倍，带宽从 20% 拉到 84%。
 
 ### 为什么 v8 没有比 v7 更快？
 
-v8 消除了 if-else 分支，但耗时与 v7 基本一致（差异在测量噪声内）。原因：
+v8 消除了分支但耗时几乎一样（差异在测量噪声内）。原因：
+
 1. 本算子是访存受限，ALU 上多算一次 exp 被访存延迟完全隐藏。
 2. 在线 Softmax 的 max 刷新天然稀疏（一行 5 万元素里真正刷新最大值的次数极少），if-else 分支高度可预测，发散开销本就很小。
 
-> v8 的价值不是性能提升，而是验证了"无分支优化的适用边界"——它在计算密集 + 分支随机的场景才值钱，在访存密集 + 分支可预测的场景里则是被隐藏的多余运算。
+> v8 的价值不是性能提升，而是验证了"无分支优化的适用边界"——它在计算密集 + 分支随机的场景才值钱，在访存密集 + 分支可预测的场景里是被隐藏的多余运算。
 
 ### 为什么 Memory 84% 却比 v5 慢？
 

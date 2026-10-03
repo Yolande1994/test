@@ -1,6 +1,6 @@
 # Softmax Forward — CUDA 算子优化
 
-从朴素的三趟遍历，到标准块级规约，再到在线 Softmax（Online Softmax），记录 Softmax 在 GPU 上的 9 个版本迭代过程。
+从朴素的三趟遍历，到 Online Softmax，记录 Softmax 的 9 个版本迭代过程。
 
 ---
 
@@ -20,7 +20,7 @@ out    = exp(row - maxval) / sum   # 第三趟：归一化写回
 
 >数值稳定性：`exp(x)` 在 `x > 88` 时会上溢为 inf，因此先减去行内最大值再算指数，数学上等价，数值上稳定。
 
-典型的**访存受限型算子（Memory-Bound）**。三趟遍历逐行读输入，每行数据只读一次无复用，计算量（max + exp + 除法）很少，核心优化目标是**减少全局内存往返、提升访存合并度与带宽利用率**。
+这是**访存受限型算子（Memory-Bound）**。三趟遍历逐行读输入，每行数据只读一次无复用，计算量（max + exp + 除法）很少，核心优化目标是**减少全局内存往返、提升访存合并度与带宽利用率**。
 
 ---
 
@@ -40,9 +40,9 @@ out    = exp(row - maxval) / sum   # 第三趟：归一化写回
 
 | 版本 | 核心实现 | 耗时 (ms) | Compute (%) | Memory (%) | 寄存器 | Grid Size | Occupancy |
 |:---:|---|:---:|:---:|:---:|:---:|:---:|:---:|
-| v1 | 单线程处理 1 行，朴素移植 | 105.91 | 9.58 | 45.84 | 40 | 16 | 100% |
-| v2 | 单 Block 一行，共享内存二分规约 | 11.52 | 36.39 | 78.16 | 28 | 8192 | 100% |
-| v3 | 单 Warp 一行，纯 Shuffle 规约 | 44.93 | 8.49 | 57.09 | 16 | 8192 | 50% |
+| v1 | 单线程一行，朴素移植 | 105.91 | 9.58 | 45.84 | 40 | 16 | 100% |
+| v2 | 单 Block 一行，二分规约 | 11.52 | 36.39 | 78.16 | 28 | 8192 | 100% |
+| v3 | 单 Warp 一行，Shuffle 规约 | 44.93 | 8.49 | 57.09 | 16 | 8192 | 50% |
 | v4 | 两级规约（Warp Shuffle + 跨 Warp 共享内存） | 14.35 | 27.28 | 60.66 | 22 | 8192 | 100% |
 | v5 | 两级规约 + 循环展开 + 读写分离 + 缓存优化 | 10.56 | 36.26 | 85.06 | 40 | 8192 | 100% |
 | v6 | 在线 Softmax，朴素移植 | 141.65 | 53.74 | 20.82 | 33 | 16 | 100% |
@@ -58,7 +58,7 @@ out    = exp(row - maxval) / sum   # 第三趟：归一化写回
 
 ## v1 — 朴素移植：单线程处理一行
 
-最直接的 CPU 移植：每个线程独立处理一行 `C` 个元素，串行完成三趟遍历。
+直接的 CPU 移植：每个线程独立处理一行 `C` 个元素，串行三趟。
 
 ```cuda
 __global__ void softmax_forward_kernel1(float* out, const float* inp, int N, int C) {
@@ -88,11 +88,11 @@ __global__ void softmax_forward_kernel1(float* out, const float* inp, int N, int
 
 ### 问题
 
-1. **并行度严重不足**：每线程负责一行，N = B*T 不过 8192 个线程，而 GPU 有数十个 SM 且每个 SM 都可以驻留上千个线程。这点线程远填不满硬件。
+1. **并行度严重不足**：每线程负责一行，N = B*T = 8192 个线程，而 GPU 有数十个 SM 且每个 SM 都可以驻留上千个线程。这点线程填不满硬件。
 2. **访存不合并**：相邻线程处理的行地址间隔 `C=50257` 个元素，Warp 内 32 个线程访问完全离散的地址，带宽利用率极低。
-3. **长串行依赖**：单线程串行跑 5 万次循环，单线程内部强数据依赖，Warp 内部指令无法并行（ILP 难展开），无法靠指令级并行隐藏循环延迟。
+3. **长串行依赖**：单线程串行跑 5 万次循环，单线程内数据强依赖，Warp 内指令无法并行（ILP 展不开），不能靠指令并行隐藏循环延迟。
 
-> Compute Throughput 只有 9.58%，Memory Throughput 也只有 45.84%——既没吃满算力，也没吃满带宽。
+> Compute Throughput 9.58%，Memory Throughput 45.84%——两个都没吃满。
 
 <br>
 
@@ -100,7 +100,7 @@ __global__ void softmax_forward_kernel1(float* out, const float* inp, int N, int
 
 ## v2 — 单 Block 一行：共享内存二分规约
 
-v1 的两个致命问题是并行度不足和访存不合并。
+v1 的两个问题是并行度不足和访存不合并。
 
 v2 改变任务划分方式：一个 Block 处理一行，块内所有线程协作分摊 C 个元素。
 
@@ -154,16 +154,16 @@ __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int
 }
 ```
 
-### 效果
+### 性能表现
 
-- 耗时从 v1 的 105.91ms 降到 **11.52ms**——约 9 倍提升。
-- Memory Throughput 从 45.84% 提升到 78.16%——本次优化最大的收益来源。
+- 耗时从 v1 的 105.91ms 降到 **11.52ms**——快了约 9 倍。
+- Memory Throughput 从 45.84% 提升到 78.16%。
 
 ### 现存问题
 
 1. **共享内存二分规约同步开销大**：每轮 stride 都要 `__syncthreads()`，block_size=512 时需要 9 轮同步。
 2. **中间结果写了又读**：第二趟把 exp 结果写到 `out`，第三趟又从 `out` 读回来求 sum，多一次全局内存往返。
-3. **标量访存**：每次只加载 1 个 float（4 字节），访存指令数多，可通过向量化访存压缩指令数。
+3. **标量访存**：每次只加载 1 个 float（4 字节），访存指令多，可通过向量化访存压缩指令数。
 > 向量化访存是通用优化技术，residual 目录里已有介绍，本篇专注 softmax 本身的优化路径，所以不再展开
 
 <br>
@@ -172,17 +172,17 @@ __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int
 
 ## v3 — 单 Warp 行级规约：纯寄存器通信的极简实现（规约机制演示）
 
-该版本仅用于介绍 warp 规约，采用「一个 Warp（32 线程）处理一行数据」的设计，全程使用 Warp Shuffle 指令完成行内规约，完全不用共享内存，没有块级同步。
+此版本仅用于介绍 warp 规约，采用「一个 Warp（32 线程）处理一行数据」的设计，全程用 Warp Shuffle 指令完成行内规约，完全不用共享内存，无块级同步。
 
 ### 设计思路
 
-在块级共享内存规约的实现中，块内规约需要把中间值写入共享内存，每一轮规约都要执行一次 `__syncthreads()` 块级同步，既有共享内存的读写延迟，也有同步开销。
+块级共享内存规约中，块内规约需要把中间值写入共享内存，每一轮规约都要执行一次 `__syncthreads()` 块级同步，有共享内存的读写延迟，也有同步开销。
 
-而 Warp Shuffle 是 GPU 的寄存器级原语：同一个 Warp 内的线程可以直接读取彼此寄存器中的值，不需要经过共享内存中转，无块级同步，理论上规约的延迟更低。
+而 Warp Shuffle 是 GPU 的寄存器级原语：同个 Warp 内的线程可直接读取彼此寄存器中的值，不需经过共享内存中转，无块级同步，理论上规约的延迟更低。
 
 ### 实现逻辑
 
-Kernel 内的四步，每一步都是 32 线程跨步遍历一行数据，通过 Warp 内规约得到行级结果：
+Kernel 内的四步，每一步都是 32 线程跨步遍历一行数据，通过 Warp 内规约得到一行的结果：
 
 ```cuda
 __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int C) {
@@ -215,7 +215,7 @@ __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int
 
 ### 性能表现
 
-在 C=50257、block=32 的配置下，单 Kernel 耗时 44.93ms。相比 v2 共享内存块级规约（block=512，耗时 11.52ms），**慢了约 4 倍**。
+在 C=50257、block=32 配置下，单 Kernel 耗时 44.93ms。相比 v2 共享内存块级规约（block=512，耗时 11.52ms），慢了约 4 倍。
 
 >这是个典型「局部最优 ≠ 全局最优」的演示。只看规约操作本身，Shuffle 寄存器通信确实比共享内存更快，但放在整个 Kernel 的尺度上，这个设计带来了更严重的硬件利用率问题。
 
@@ -234,17 +234,17 @@ __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int
 
    v2 用 512 个线程一起算一行，每线程串行遍历约 98 个元素；v3 只有 32 个线程算一行，每线程串行遍历约 1570 个元素——相差 16 倍。
 
-   循环内部有数据依赖（`maxval = fmaxf(maxval, x[i])`），每轮都要等上一轮算完，串行链越长，延迟越难被其他指令或其他 Warp 掩盖。
+   循环内部有数据依赖（`maxval = fmaxf(maxval, x[i])`），每轮都要等上一轮算完，串行链越长，延迟越难被其他指令或 Warp 掩盖。
 
 2. **单 Warp Block 打不满 SM 调度槽**
 
-   SM 能同时驻留的 Block 数量有硬件上限。v3 每个 Block 只含 1 个 Warp，即使 Block 数达到硬件上限时，SM 上的 Warp 总数也只能到最大值的一半（实测 Occupancy 仅 50%，SM 的 warp slot 有一半空着）。
+   SM 能同时驻留的 Block 数量有硬件上限。v3 每个 Block 只含 1 个 Warp，即使 Block 数达到硬件上限时，SM 上的 Warp 总数也只能达最大值的一半（实测 Occupancy 仅 50%，SM 的 warp slot 有一半空着）。
 
 3. **两者叠加 → 延迟无法隐藏**
 
    GPU 隐藏延迟的手段是：一个 Warp 等内存时，SM 切换到另一个就绪 Warp 继续执行。
 
-   v3 同时存在两个问题：活跃 Warp 总数只有 v2 的一半（第 2 点），且每个 Warp 的串行链又长 16 倍（第 1 点）。访存或计算时既没有足够多的其他 Warp 可切换，单个 Warp 内部也没有足够的独立指令来重叠，内存延迟暴露。
+   v3 同时存在两个问题：活跃 Warp 总数只有 v2 的一半（第 2 点），每个 Warp 的串行链又长 16 倍（第 1 点）。访存或计算时既没有足够的其他 Warp 可切换，单 Warp 内部也没足够的独立指令来重叠，内存延迟暴露。
 
 ### 版本定位
 
@@ -260,11 +260,11 @@ __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int
 
 ### 设计思路
 
-v2 的共享内存二分规约有两个开销：每个线程都要把局部结果写进共享内存（block_size 个 float），每轮 stride 都要 __syncthreads() 块级同步。
+v2 的二分规约有两个开销：每个线程要把局部结果写进共享内存（block_size 个 float），每轮 stride 要 __syncthreads() 块级同步。
 
-v4 沿用 v2 的"1 Block 处理一行"划分，但把规约拆成两级：
+v4 沿用 v2 的"一 Block 处理一行"划分，但把规约拆成两级：
 
-- **第一级（Warp 内）**：32 个线程用 Shuffle 指令在寄存器内完成规约，不需要共享内存，也没有块级同步。
+- **第一级（Warp 内）**：32 个线程用 Shuffle 指令在寄存器内完成规约，不需共享内存，没有块级同步。
 - **第二级（跨 Warp）**：每个 Warp 的 lane 0 把结果写入共享内存（只需 warpsPerBlock 个 float），由 thread 0 读出来合并。
 
 这样共享内存用量从 block_size 个降到 warpsPerBlock 个 float，块级同步次数从 O(log₂(block_size)) 次降到 O(1) 次
@@ -311,7 +311,7 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
 | 跨 Warp 同步次数 | 9 次 `__syncthreads()` | 2 次 `__syncthreads()` |
 | 共享内存 Bank Conflict | 每轮多线程并发写，有冲突 | 只有 lane 0 写，无冲突 |
 
-### 效果
+### 性能表现
 
 耗时 14.35ms，反而不如 v2 的 11.52ms，不是算法本身问题，具体原因分析放在末尾，详见「附录：v4 为什么比 v2 慢」
 
@@ -327,14 +327,14 @@ v4 是 v2 的算法优化版，它降低了共享内存占用，也为下面的 
 
 ### 设计思路
 
-v4 还有三个可优化的点：循环控制指令多、exp 结果写了又读、标量访存指令数多。v5 围绕这三点做了 6 项优化：
+v4 还有三个可优化点：循环控制指令多、exp 结果写了又读、标量访存指令数多。v5 围绕这三点做 6 项优化：
 
 1. **循环展开**：减少循环控制指令，批量发射访存请求，用计算时间隐藏访存延迟。
-2. **计算合并（省一趟全局读）**：计算 exp 写回的同时，在寄存器内直接累加局部 sum，不再把 exp 结果写回全局内存后再读回来求 sum。
-3. **共享内存分区**：`maxvals`/`sumvals` 独立两段，逻辑清晰，防覆盖。
+2. **计算合并**：计算 exp 写回的同时，在寄存器内直接累加局部 sum，不再把 exp 结果写回全局内存后再读回来求 sum，省一趟全局读。
+3. **共享内存分区**：`maxvals`/`sumvals` 独立两段，逻辑清晰防覆盖。
 4. **流式访存**：`__ldcs` 加载只读一次的输入，避免污染缓存。
 5. **边界处理**：读操作用 `min(C-1, idx)` 钳位（重复读不影响 max/sum 结果），写操作严格 `if (idx < C)` 判断（越界写会破坏其他行）。
-6. **读写分离**：先批量加载到寄存器、再集中计算写回，让编译器有充足的指令调度空间。
+6. **读写分离**：先批量加载到寄存器、再集中计算写回，给编译器充足的指令调度空间。
 
 ```cuda
 __global__ void softmax_forward_kernel5(float* out, const float* inp, int N, int C) {
@@ -437,7 +437,7 @@ __global__ void softmax_forward_kernel5(float* out, const float* inp, int N, int
 | v4 | 14.35 | 60.66 | 27.28 |
 | v5 | **10.56** | **85.06** | 36.26 |
 
-8x 循环展开让编译器批量发射 load，计算合并省掉了一整趟全局内存读 exp 结果。Memory Throughput 从 60% 拉到 85%，DRAM 带宽进一步吃满。
+8x 循环展开让编译器批量发射 load，计算合并省掉了一整趟从全局内存读 exp 结果。Memory Throughput 从 60% 拉到 85%，DRAM 带宽进一步吃满。
 
 **下图是两个 kernel 求 max 循环的 SASS 对比：**
 
@@ -459,7 +459,7 @@ __global__ void softmax_forward_kernel5(float* out, const float* inp, int N, int
 | v4 | 27% | 22% |
 | v5 | 33% | 30% |
 
-管线利用率的变化和 SASS 证据一致：v5 的访存管线更忙了——8 个 load 一起发，单位时间内搬运的数据更多。计算管线也更忙了——同样的计算量在更短时间里完成。
+管线利用率的变化和 SASS 证据一致：v5 的访存管线更忙——8 个 load 一起发，单位时间内搬运的数据更多。计算管线也更忙——同样的计算量在更短时间里完成。
 
 >v5 的内存带宽已到 85%，但访存管线才用了 33%——说明瓶颈在 DRAM 带宽本身，不在 GPU 算力。
 
@@ -542,7 +542,7 @@ float offset = shared[0];
 
 ### 数学原理
 
-标准三趟法要求先知道整行最大值才能算 sum。
+标准三趟法要先知道整行最大值才能算 sum。
 
 **在线 Softmax**（基于论文《Online normalizer calculation for softmax》）的核心是：**边遍历边维护当前已知的 max 和 sum，遇到更大的值时把旧 sum 折算到新基准上。**
 
@@ -563,7 +563,7 @@ float offset = shared[0];
 
 v1~v5 的三趟法要求 exp 的中间结果先写全局内存、再读回来求 sum，多一次全局内存往返。
 
-在线 Softmax 的工程价值在于：利用上面的递推式，把"求 max"和"求 sum"合并到同一次输入遍历中，省去了 exp 中间结果的全局内存读写。访存从 3 次（读输入求 max、读输入算 exp 写回、读 exp 求 sum）降为 2 次（读输入边遍历边算、写输出归一化）。
+在线 Softmax 的工程价值在于：利用上面的递推式，把"求 max"和"求 sum"合并到同一次输入遍历中，省去 exp 中间结果的全局内存读写。访存从 3 次（读输入求 max、读输入算 exp 写回、读 exp 求 sum）降为 2 次（读输入边遍历边算、写输出归一化）。
 
 ```cuda
 __global__ void online_softmax_forward_kernel6(float* out, const float* inp, int N, int C) {
@@ -607,22 +607,22 @@ __global__ void online_softmax_forward_kernel6(float* out, const float* inp, int
 sum = sum * expf(maxval_prev - maxval) + expf(current_val - maxval);
 ```
 
-`sum` 是一个累加器，每次循环迭代都必须等上一次的 `sum` 完全计算完毕，这就形成了一个贯穿整个 C=50257 次循环的单链串行依赖。而 `expf` 是一个高延迟的函数，这个延迟完全暴露在串行链上。
+`sum` 是一个累加器，每次循环迭代都必须等上一次的 `sum` 完全计算完毕，这就形成一个贯穿 C=50257 次循环的单链串行依赖。而 `expf` 是一个高延迟的函数，这个延迟完全暴露在串行链上。
 
 对比 v1 的第二趟：
 
 ```cuda
 out_row[j] = expf(inp_row[j] - maxval);  // expf 之间互相独立，可并行发射到 SFU
-sum += out_row[j];                       // 依赖链极短（1 次加法仅约 4 周期）
+sum += out_row[j];                       // 依赖链极短
 ```
 
-v1 里多个 `expf` 互相独立没有依赖，可以启动指令级并行（ILP），并行发射到 SFU 流水线；
+v1 里多个 `expf` 相互间没有依赖，可以启动指令级并行（ILP），并行发射到 SFU 流水线；
 
-虽然 `sum += out_row[j]` 也是串行，但加法指令延迟很低，且 `sum` 依赖的是上一个 `expf` 的结果，不会阻塞新的 `expf` 发射。
+虽然 `sum += out_row[j]` 也是串行，但加法指令延迟很低（大概 4 周期），且 `sum` 依赖的是上一个 `expf` 的结果，不阻塞新的 `expf` 发射。
 
-此外，`if (current_val > maxval)` 分支判断在 Warp 内会产生控制发散，Warp 被迫串行执行两个分支，进一步拖慢速度。
+此外，如碰到 `if (current_val > maxval)` 分支判断在 Warp 内会产生控制发散，Warp 被迫串行执行两个分支，进一步拖慢速度。
 
-> v6 是在线算法的基准，它演示原理，也证明减少1次访存的收益需要足够的并行度来兑现。
+> v6 是在线算法的基准，它演示原理，也证明减少1次访存的收益可能被漫长的依赖性串行计算抵消。
 
 <br>
 
@@ -630,7 +630,7 @@ v1 里多个 `expf` 互相独立没有依赖，可以启动指令级并行（ILP
 
 ## v7 / v8 — 在线 Softmax 的 Warp 级并行
 
-v6 的问题是每线程串行遍历 C 次。v7/v8 改为**一个 Warp 处理一行**，32 个线程分摊 C 个元素，串行链缩短 32 倍。
+v6 问题是每线程串行遍历 C 次。v7/v8 改为**一个 Warp 处理一行**，32 个线程分摊 C 个元素，串行链缩短 32 倍。
 
 #### 工具函数
 
@@ -671,9 +671,9 @@ __global__ void online_softmax_forward_kernel7(float* out, const float* inp, int
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    int row = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
-    if (row >= N) return;
-    const float* x = inp + row * C;
+    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    if (idx >= N) return;
+    const float* x = inp + idx * C;
 
     // 每线程维护局部 SumMax，逐个元素合并
     SumMax sm_partial = {-INFINITY, 0.0f};
@@ -685,7 +685,7 @@ __global__ void online_softmax_forward_kernel7(float* out, const float* inp, int
 
     // 归一化写回
     for (int i = warp.thread_rank(); i < C; i += warp.size())
-        out[row * C + i] = expf(x[i] - sm_total.maxval) / sm_total.sum;
+        __stcs(out + idx * C + i, expf(x[i] - sm_total.maxval) / sm_total.sum);
 }
 ```
 
@@ -752,7 +752,7 @@ __global__ void online_softmax_forward_kernel8(float* out, const float* inp, int
 从 v6 到 v7，并行度增加、串行链缩短，耗时降 9 倍，带宽从 20% 升到 84%。
 
 ### v8 和 v7 的关系
-v8 和 v7 做的事完全一样，性能也基本一致（差异在测量噪声内）。v7 的规约逻辑藏在 `cg::reduce` 库里，v8 把手写 shuffle 过程摆上明面。
+v8 和 v7 做的事一样，性能也基本一致（差异在测量噪声内）。v7 的规约逻辑藏在官方 `cg::reduce` 库里，v8 把手写 shuffle 过程展开显示。
 
 <br>
 
@@ -762,9 +762,9 @@ v8 和 v7 做的事完全一样，性能也基本一致（差异在测量噪声�
 
 ### 设计思路
 
-v7/v8 用一个 Warp（32 线程）处理一行，在 C=50257 下每线程仍要串行处理约 1570 个元素，串行依赖链仍然偏长。
+v7/v8 用一个 Warp（32）处理一行，C=50257 情况下每线程仍要串行处理约 1570 个元素，串行依赖链还是偏长。
 
-v9 把并行粒度从 Warp 级提升到 Block 级：**一个 Block 处理一行，块内 block_size 个线程共同分摊 C 个元素**（block_size = 512 时，每线程处理约 98 个元素）。这和 v4/v5 处理普通 Softmax 的任务划分一致。
+v9 把并行粒度从 Warp 级提升到 Block 级：**一个 Block 处理一行，块内 block_size 个线程共同分摊 C 个元素**（block_size = 512 时，每线程处理约 98 个元素）。和 v4/v5 处理普通 Softmax 的任务划分一致。
 
 #### 规约流程
 
@@ -825,42 +825,29 @@ __global__ void online_softmax_forward_kernel9(float* out, const float* inp, int
 | v7/v8 | 15.20 | 16.62 | 84.59 | 512 |
 | v9 | **10.86** | 26.44 | 80.09 | 8192 |
 
-相比 v7/v8，v9 耗时降低约 28%，主要来自两点（以 block_size = 512 为尺）：
+相比 v7/v8，v9 快了约 28%，主要是三点（以 block_size = 512 为尺）：
 
-1. **串行链缩短 16 倍**：每线程处理的元素从 1570 个降到 98 个，expf 的串行依赖被大幅压缩
+1. **串行链缩短 16 倍**：每线程处理元素从 1570 个降到 98 个，expf 延迟链大幅缩短。
 2. **Grid Size 扩大 16 倍**：从 512 个 Block 增加到 8192 个，SM 全部被填满
+3. **能切换的 Warp 多了 16 倍**：v7/v8：512×512=26万线程，v9：8192×512=419万线程，线程越多，访存和计算延迟越能藏住
 
->v9 的 Memory Throughput（80.09%）比 v7/v8（84.59%）略低，但总耗时反而更短——说明带宽百分比不能单独决定性能，Grid Size 和 Occupancy 同样关键。
+>v9 的 Memory Throughput（80.09%）比 v7/v8（84.59%）略低，但总耗时反而更短——说明带宽百分比不能单独决定性能，Grid Size 和 Occupancy 也很关键。
 
->**Tips：**
 >- **Grid 打满** = 所有 SM 都有活干（总量问题，是否有足够多的 Block 让 GPU 上每个 SM 都能分到任务）
 >- **Occupancy 高** = 每个 SM 上 Warp 足够多（密度问题，单个 SM 上能不能同时驻留最多的 Warp）
 >- 两个都要满足。Grid 不够 → 部分 SM 空闲；Occupancy 不够 → SM 上可切换 Warp 太少，延迟暴露。
 
-v9 目前没有做循环展开和向量化访存。在线 Softmax 主循环里的 sumval 是串行累加，展开后只能批量发出 load 指令，reduce_sum_max_op 部分仍需串行执行，收益不如 v5 直接。
+v9 目前没做循环展开和向量化访存。在线 Softmax 主循环里的 sumval 是串行累加，展开后只有发 load 指令能并行，reduce_sum_max_op 部分仍要串行，收益不如 v5 直接。
 
 <br>
 
 ## 在线 Softmax 的真正价值：Flash Attention
 
-独立算子性能测试里，v9（两趟法）和 v5（三趟法）耗时基本持平，但独立算子的场景不能体现它的核心作用，那就是：**在线 Softmax 是 Flash Attention 能成立的数学前提。**
+虽然独立算子性能测试，v9（两趟法）和 v5（三趟法）耗时基本持平，但独立算子场景不能体现它的核心作用，那就是：**在线 Softmax 是 Flash Attention 能成立的数学前提。**
 
-### 为什么标准三趟法在 Flash Attention 里行不通
+Flash Attention 处理 Attention 时，分数矩阵 S 是 (T, T)，T 很大时整个矩阵放不进 SRAM，必须按 K/V 块流式处理。标准三趟法要求先读完整行求 max、再读完整行算 exp 求 sum、再读完整行归一化——每个 K/V 块要在 HBM 里往返三次。
 
-在 Attention 公式里，对每个 batch、每个 head，注意力分数矩阵 S 的形状是 (T, T)。
-
-Flash Attention 解决的问题是：当序列长度 T 很大时，整个分数矩阵放不进 SRAM，必须按 K/V 块分段流式处理。
-
-标准三趟法要求：
-1. 先读完整行，求最大值
-2. 再读完整行，算 exp 并求和
-3. 再读完整行，归一化
-
-但在 Flash Attention 场景下，"整行"根本不在 SRAM 里，而是被切成了分块——每次读一个 K/V 块，处理完就丢弃，下一块再从 HBM 读。三趟法意味着每个 K/V 块要在 HBM 里往返三次，不符合 Flash Attention 减少访存的设计哲学。
-
-### 在线 Softmax 如何让 Flash Attention 成立
-
-Flash Attention 对每个 Q tile 维护一个运行状态 (m, l, O)，每读一个 K/V 块就更新一次：
+在线 Softmax 不需要一次看到整行。Flash Attention 对每个 Q tile 维护 (m, l, O)，每读一个 K/V 块就更新一次：
 
 ```
 m = -inf, l = 0, O = 0
@@ -872,19 +859,12 @@ for 每个 K/V tile：
     l = l * exp(m - m_new) + rowsum(P)        # 指数和折算到新基准
     O = O * exp(m - m_new) + P @ V_tile       # 输出也折算到新基准
     m = m_new
-
 O = O / l
 ```
 
-这里的 `exp(m - m_new)` 就是在线 Softmax 的折算项：当读入新的 K/V 块后，如果发现了更大的分数，之前所有块的 exp 和输出都要按比例缩小到新基准上。
-
-正因为有了这个折算机制，每个 K/V 块**只需要从 HBM 读一次、写一次**，不需要在 HBM 里反复往返。Flash Attention 由此把标准注意力的峰值显存占用从 O(T²)（存储完整注意力矩阵）降到 O(T)（只存 Q/K/V/输出），HBM 访存量从 O(T²) 降到 O(T²/M)（M 为 K/V 块大小）。
+exp(m - m_new) 就是前面 v6/v8 里反复出现的折算项。有了这个，每个 K/V 块从 HBM 读一次写一次就行。Flash Attention 把峰值显存从 O(T²) 降到 O(T)，HBM 访存从 O(T²) 降到 O(T²/M)（M 是 K/V 块大小）。
 
 >**关于 Flash Attention 的原理和代码实现，可见本仓库的 attention 目录**
-
-### 小结
-
-在线 Softmax 不是一个"省一趟访存的优化技巧"，它的数学形式天然支持流式处理——可以边读边算、动态更新，不用一次性看到全部数据。这种特性使它成为 Flash Attention 等内存高效注意力算法的基础。
 
 <br>
 

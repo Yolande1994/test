@@ -176,7 +176,7 @@ __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int
 
 ### 设计思路
 
-块级共享内存规约中，块内规约需要把中间值写入共享内存，每一轮规约都要执行一次 `__syncthreads()` 块级同步，有共享内存的读写延迟，也有同步开销。
+块级共享内存规约中，块内规约需要把中间值写入共享内存，每一轮规约都要执行一次 `__syncthreads()` 块级同步，有共享内存读写延迟，也有同步开销。
 
 而 Warp Shuffle 是 GPU 的寄存器级原语：同个 Warp 内的线程可直接读取彼此寄存器中的值，不需经过共享内存中转，无块级同步，理论上规约的延迟更低。
 
@@ -248,9 +248,9 @@ __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int
 
 ### 版本定位
 
-这是一个**教学演示版本**，价值在于清晰展示 Warp 级规约的核心思想和最简写法。
+这是个**教学演示版本**，价值在于展示 Warp 级规约的核心思想和最简写法。
 
-如果要发挥 Warp Shuffle 规约的优势，正确的做法是 **将多个 Warp 打包进同一个 Block**（每个 Warp 各处理一行），既保留寄存器级规约的低延迟，又保证足够的 SM 占用率。参考 v7、v8。
+如要发挥 Warp Shuffle 规约的优势，正确做法是 **将多个 Warp 打包进同一个 Block**（每个 Warp 各处理一行），既保留寄存器级规约的低延迟，又保证足够的 SM 占用率。参考 v7、v8。
 
 <br>
 
@@ -317,7 +317,7 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
 
 ### 版本定位
 
-v4 是 v2 的算法优化版，它降低了共享内存占用，也为下面的 v5 版提供了干净的骨架。
+v4 是 v2 的算法优化版，它降低了共享内存占用，也为下面 v5 版提供了干净的骨架。
 
 <br>
 
@@ -465,7 +465,7 @@ __global__ void softmax_forward_kernel5(float* out, const float* inp, int N, int
 
 ### 版本定位
 
-这是**普通 softmax 的最优版本**。在不改变算法结构（遍历三趟全局内存）的前提下，通过循环展开、计算合并和流式访存等，让带宽利用率靠近硬件极限。
+这是普通 softmax 最优版本。在不改变算法结构（遍历三趟全局内存）前提下，主要通过循环展开、计算合并等，让带宽利用率靠近硬件极限。
 
 在寄存器压力范围内，通过调整循环展开因子的大小，或配合向量化访存技术，往往还能**进一步**压榨带宽。
 
@@ -563,7 +563,7 @@ float offset = shared[0];
 
 v1~v5 的三趟法要求 exp 的中间结果先写全局内存、再读回来求 sum，多一次全局内存往返。
 
-在线 Softmax 的工程价值在于：利用上面的递推式，把"求 max"和"求 sum"合并到同一次输入遍历中，省去 exp 中间结果的全局内存读写。访存从 3 次（读输入求 max、读输入算 exp 写回、读 exp 求 sum）降为 2 次（读输入边遍历边算、写输出归一化）。
+在线 Softmax 工程价值在于：利用上面的递推式，把"求 max"和"求 sum"合并到同一次输入遍历中，省去 exp 中间结果的全局内存读写。访存从 3 次（读输入求 max、读输入算 exp 写回、读 exp 求 sum）降为 2 次（读输入边遍历边算、写输出归一化）。
 
 ```cuda
 __global__ void online_softmax_forward_kernel6(float* out, const float* inp, int N, int C) {
@@ -620,7 +620,15 @@ v1 里多个 `expf` 相互间没有依赖，可以启动指令级并行（ILP）
 
 虽然 `sum += out_row[j]` 也是串行，但加法指令延迟很低（大概 4 周期），且 `sum` 依赖的是上一个 `expf` 的结果，不阻塞新的 `expf` 发射。
 
-此外，如碰到 `if (current_val > maxval)` 分支判断在 Warp 内会产生控制发散，Warp 被迫串行执行两个分支，进一步拖慢速度。
+此外，如碰到 `if (current_val > maxval)` 分支判断，会在 Warp 内会产生控制发散，Warp 被迫串行执行两个分支，进一步拖慢速度。
+
+**NCU Warp State 对比（左 v1，右 v6）：**
+
+![v1 vs v6  Warp State](images/softmax11.png)
+
+**v1**：Long Scoreboard 115%、LG Throttle 91% —— 绝大部分时间在等 DRAM 数据，典型访存受限。
+
+**v6**：Long Scoreboard 只剩 3.73%（几乎不等内存），Short Scoreboard 飙到 86.58% —— 绝大部分时间在等 expf 结果。可见从访存受限变成计算延迟受限。
 
 > v6 是在线算法的基准，它演示原理，也证明减少1次访存的收益可能被漫长的依赖性串行计算抵消。
 
@@ -862,7 +870,7 @@ for 每个 K/V tile：
 O = O / l
 ```
 
-exp(m - m_new) 就是前面 v6/v8 里反复出现的折算项。有了这个，每个 K/V 块从 HBM 读一次写一次就行。Flash Attention 把峰值显存从 O(T²) 降到 O(T)，HBM 访存从 O(T²) 降到 O(T²/M)（M 是 K/V 块大小）。
+exp(m - m_new) 就是前面反复出现的折算项。有了这个，每个 K/V 块从 HBM 读一次写一次就够。Flash Attention 把峰值显存从 O(T²) 降到 O(T)，HBM 访存从 O(T²) 降到 O(T²/M)（M 是 K/V 块大小）。
 
 >**关于 Flash Attention 的原理和代码实现，可见本仓库的 attention 目录**
 
@@ -947,7 +955,7 @@ Long Scoreboard stall 是"等 load 数据从 DRAM 回来"的时间占比。v2 �
 
 ### SASS 反汇编：真正原因
 
-对两个 Kernel 的 SASS 逐行分析后，发现了 NCU 指标无法直接看到的事实：
+对两个 Kernel 的 SASS 逐行分析后，发现了其他 NCU 指标无法直接看到的事实：
 
 **v2 的主循环被 nvcc 自动 4 倍展开了，v4 的主循环完全没有展开。**
 
@@ -994,7 +1002,7 @@ FMNMX.FTZ R4, R3, R4           # max（必须等 load 数据回来）
 @!P1 BRA .L_x_2                # 分支
 ```
 
->编译器把 IADD 和 ISETP 插在 LDG 和 FMNMX 之间，因为这两条不依赖 load 结果——趁内存返回的间隙先做循环控制。但即使如此，一个循环体也只有 1 个 load 发出。
+>编译器把 IADD 和 ISETP 插在 LDG 和 FMNMX 之间，因为这两条不依赖 load 结果——趁内存返回的间隙先做循环控制。但无论如何，一个循环里也只有 1 个 load 发出。
 
 exp、sum、normalize 循环也全部是 1 倍，没有展开。
 
@@ -1040,4 +1048,4 @@ for (int i = tid; i < C; i += block_size) {}
 
 ### 启示
 
-**性能优化除了看算法逻辑，还要考虑编译器生成。** "算法上更优"的实现，如果编译器没有帮着展开循环、批量发射 load 等操作，反而可能更慢。这也是为什么 v5 在 v4 的骨架上手动加了 `#pragma unroll`——显式强制展开，不跟编译器赌启发式。
+**性能优化除了看算法逻辑，还要考虑编译器生成。** "算法上更优"的实现，如果编译器没有帮着做展开循环、批量发射 load 等操作，反而可能更慢。这也是为什么 v5 在 v4 的骨架上手动加了 `#pragma unroll`——显式强制展开，不跟编译器赌启发式。

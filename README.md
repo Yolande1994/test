@@ -361,11 +361,11 @@ __device__ void matmul_tri4(float* p, int PS, const float* k, int KS, const floa
 
 Compute / Memory 同时达到 72.29% / 72.29%，从 v1~v3 的内存受限，推进到计算与访存均衡。
 
-端到端耗时跑赢 cuBLAS：matmul_tri4 **2.21ms** vs cuBLAS gemm **3.05ms**（cuBLAS 若算上 permute 则是 3.52ms）。
-
----
+端到端耗时跑赢 cuBLAS：matmul_tri4 **2.21ms**  vs  cuBLAS gemm **3.05ms**（cuBLAS 若算上 permute 则是 3.52ms）。
 
 <br>
+
+---
 
 ## v4 是怎么「赢」cuBLAS 的
 
@@ -375,9 +375,9 @@ v4 端到端更快，但要分清它赢在哪里：
 2. **单设备吞吐 cuBLAS 仍然更高**：gemm 12.88 GFLOPs / 3.05ms ≈ **4.2 TFLOPS**；v4 有效 6.45 GFLOPs / 2.21ms ≈ **2.9 TFLOPS**（NCU 口径）。
 3. **手写核赢在工作量和融合**：只算一半 + 直接适配打包输入（省掉 0.47ms 的 permute），端到端耗时反超。
 
----
-
 <br>
+
+---
 
 ## 后续优化方向
 

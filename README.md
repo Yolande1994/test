@@ -66,7 +66,7 @@ S = Q @ Kᵀ × (1/√HS)
 4. 完整输出 preatt (B,NH,T,T) —— 含上三角，cuBLAS 不做因果跳过
 ```
 
-**为何先做 permute（维度重排）**
+### 为何先做 permute（维度重排）
 
 `cublasSgemmStridedBatched` 要求 Q/K/V 是三个独立、连续的张量，且批量维度在前——每个头的 `(T,HS)` 小矩阵必须在内存里连续，才能被当成一个批量。
 
@@ -282,93 +282,102 @@ for (int i = 0; i < 8; ++i) {
 
 ## v4 — 共享内存分块：计算与访存达到均衡
 
-### 设计思路
+**设计思路**
 
-把公共维度 `HS` 按 32 个元素切成多个分片，每个分片先由**整个 Block 的 256 个线程协作加载**到共享内存，计算阶段全部从共享内存读，不再碰全局显存。
+把公共维度 `HS` 按 32 个元素切成多个分片，
+
+每个分片先由 Block 的全部线程一起加载到共享内存，
+
+计算阶段再全部从共享内存读，不碰全局显存。
 
 - 共享内存延迟约 20~30 周期，远低于全局显存；
 - 128×128 输出块对应的 128 行 Q + 128 行 K，每次只载入 32 维分片，逐片累加。
 
 ```cuda
-__shared__ float lhs_s[128][32];   // 128 个 Q 行的 32 维分片
-__shared__ float rhs_s[128][32];   // 128 个 K 行的 32 维分片
+__device__ void matmul_tri4(float* p, int PS, const float* k, int KS, const float* q, int QS, int T, int HS, float alpha) {
+    int i_base = blockIdx.x * 128 + threadIdx.x * 8;   // 本线程负责的 8 个 Q 行
+    int j_base = blockIdx.y * 128 + threadIdx.y * 8;   // 本线程负责的 8 个 K 
+    // 块级掩码：整块都在上三角才退出。不能像 v1~v3 那样在顶部做 8×8 线程级退出（原因下面讲）。
+    if (blockIdx.y > blockIdx.x) return;
+    // 指针平移到整个线程块负责的 128 行起始位置（不再是本线程的 8 行），加载阶段搬的是整块数据
+    q += blockIdx.x * 128 * QS;
+    k += blockIdx.y * 128 * KS;
+    __shared__ float lhs_s[128][32];   // 128 个 Q 行的 32 维分片
+    __shared__ float rhs_s[128][32];   // 128 个 K 行的 32 维分片
+    float vals[8][8] = {};             // 8×8 部分和常驻寄存器，所有分片累加完就是最终结果
 
-for (int so = 0; so < HS; so += 32) {
-    // 阶段一：全线程协作加载（加载阶段上三角线程也不能退出！）
-    __syncthreads();
-    for (int y = threadIdx.y / 2; y < 128; y += 8) {
-        int xo = (threadIdx.y % 2) * 16;        // 同组两个线程拼一行的前/后 16 列
-        lhs_s[y][threadIdx.x + xo] = q[y * QS + so + threadIdx.x + xo];
-        rhs_s[y][threadIdx.x + xo] = k[y * KS + so + threadIdx.x + xo];
+    // 公共维度 HS 被拆成多个 32 维的块，每次处理一个 32 维分片，逐块加载到共享内存计算
+    for (int so = 0; so < HS; so += 32) {
+        // 阶段一：全线程协作加载
+        __syncthreads();
+        for (int y = threadIdx.y / 2; y < 128; y += 8) {
+            int xo = (threadIdx.y % 2) * 16;   // 同组两个线程分别搬一行的 前/后 各16列
+            lhs_s[y][threadIdx.x + xo] = q[y * QS + so + threadIdx.x + xo];
+            rhs_s[y][threadIdx.x + xo] = k[y * KS + so + threadIdx.x + xo];
+        }
+        __syncthreads();
+
+        // 阶段二：全部从共享内存取数做 8×8 部分点积，不再碰全局显存
+        for (int si = 0; si < 32; ++si) {
+            float rhs[8];
+            for (int u = 0; u < 8; ++u)
+                // (threadIdx.x + si) % 32：把 warp 内 32 个线程访问的列打散到不同 bank，避免冲突
+                rhs[u] = rhs_s[threadIdx.y * 8 + u][(threadIdx.x + si) % 32];
+            for (int ii = 0; ii < 8; ++ii) {
+                float lhs = lhs_s[threadIdx.x * 8 + ii][(threadIdx.x + si) % 32];
+                for (int ji = 0; ji < 8; ++ji)
+                    vals[ii][ji] += lhs * rhs[ji];
+            }
+        }
     }
-    __syncthreads();
 
-    // 阶段二：基于共享内存做 8×8 部分点积
-    for (int si = 0; si < 32; ++si) {
-        float rhs[8];
-        for (int u = 0; u < 8; ++u)
-            // (threadIdx.x + si) % 32 把列索引打散到不同 bank，避免 bank 冲突
-            rhs[u] = rhs_s[threadIdx.y * 8 + u][(threadIdx.x + si) % 32];
-        for (int ii = 0; ii < 8; ++ii) {
-            float lhs = lhs_s[threadIdx.x * 8 + ii][(threadIdx.x + si) % 32];
-            for (int ji = 0; ji < 8; ++ji)
-                vals[ii][ji] += lhs * rhs[ji];
+    // 阶段三：写回。所有计算完成之后才做 8×8 线程级因果判断
+    // 不写入对角线以上的区域（此时加载和计算都做完了，不需要无效线程参与了，才做 8×8 线程级的因果掩码判断：完全在上三角的区域直接返回，不写结果）
+    if (j_base > i_base) return;
+    for (int ii = 0; ii < 8; ++ii) {
+        for (int ji = 0; ji < 8; ji += 4) {
+            int i = i_base + ii;
+            int j = j_base + ji;
+            float4 result;
+            result.x = vals[ii][ji + 0] * alpha;
+            result.y = vals[ii][ji + 1] * alpha;
+            result.z = vals[ii][ji + 2] * alpha;
+            result.w = vals[ii][ji + 3] * alpha;
+            st_vec(p + i * PS + j, result);   // float4 向量化写回
         }
     }
 }
-// 全部算完后才做线程级因果判断，不写无效上三角
 ```
 
-### 两个容易忽略的细节
+> **加载阶段线程不能提前退出**：  
+> v1~v3 每个线程只管自己的活，顶部用 `if (j_base > i_base) return;` 退出不影响别人；  
+> v4 的加载是整个 block 全部线程一起搬，每线程固定负责总数据的一部分，谁退出，那些数据就没人搬。  
+> 且 `__syncthreads()` 是整块栅栏，部分线程提前 return 会让剩余线程永远等不到（死锁）。  
+> 所以 v4 顶部只能做块级退出，8×8 线程级的判断要推迟到计算完、写回前。
 
-1. **加载阶段不能提前退出**：v1~v3 里整块在上三角的线程直接 return，但 v4 的共享内存加载需要 256 个线程共同参与——少一个线程，它负责的那部分数据就没人搬。因此加载阶段只做块级判断，等全部计算完成、写结果时才跳过无效区域。
-2. **临时重组线程分工**：`threadIdx.y` 两两分组，每线程搬一行里的 16 个连续元素，让 Warp 内地址完全连续（100% 合并访问）；计算阶段的分工与加载阶段完全不同。
+**性能表现**: 
 
-### 性能表现
+3.28ms → 2.21ms，快约 1.5 倍。
 
-3.28ms → **2.21ms，快约 1.5 倍**。Compute / Memory 同时达到 **72.29% / 72.29%**——从 v1~v3 的内存受限，推进到计算与访存均衡，这是本项目最优手写内核。
+Compute / Memory 同时达到 **72.29% / 72.29%**，从 v1~v3 的内存受限，推进到计算与访存均衡。
 
-### 版本定位
-
-端到端耗时跑赢 cuBLAS：2.21ms vs cuBLAS gemm 3.05ms（含 permute 3.52ms）。
+端到端耗时跑赢 cuBLAS：2.21ms vs cuBLAS gemm 3.05ms（cuBLAS 若算上 permute 则是 3.52ms）。
 
 <br>
 
 ---
 
-## 路径总结
+## v4 是怎么「赢」cuBLAS 的
 
-```
-v1 (47.42ms)  朴素移植：Q/K 行各重复读 8 次，Memory 98%（内存墙）
-  ↓  循环重排，寄存器复用（每元素读 1 次）
-v2 (7.21ms)   快 6.6 倍，但标量加载、合并度低
-  ↓  float4 向量化（128 位合并访存，指令数 1/4）
-v3 (3.28ms)   快 2.2 倍，但数据仍直接读全局显存
-  ↓  共享内存 128×32 分块（协作加载 + bank 冲突打散）
-v4 (2.21ms)   快 1.5 倍，Compute/Memory 均 72%，手写最优
+v4 端到端更快，但要分清它赢在哪里：
 
-对照：v0 cuBLAS 全矩阵路线（permute 0.47 + gemm 3.05 = 3.52ms）
-```
-
-- v1→v4 共提速约 **21.5 倍**，主线收益依次来自**寄存器复用 → 访存合并 → 存储层级提升**；
-- 与 Softmax 优化线不同：Softmax 始终是内存受限，靠减少访存趟数和循环展开；本算子最终抵达计算/访存均衡，因为 GEMM 算术强度更高。
-
----
-
-## 公平性说明：v4 是怎么「赢」cuBLAS 的
-
-v4 端到端更快，但要分清它赢在哪里，避免误读成「手写 GEMM 算法击败了 cuBLAS」：
-
-1. **同精度**：cuBLAS 强制纯 FP32（`CUBLAS_DEFAULT_MATH`）。`common.h` 默认可能开启 TF32 张量核，其 10 位尾数会产生 ~1e-4 误差、且精度与手写核不一致；TF32 理论峰值比 FP32 高约 2~8 倍（视架构而定），但那属于另一精度档。
-2. **计算量口径不同**：cuBLAS 算全矩阵 **12.88 GFLOPs**；手写核只算下三角，有效 **6.45 GFLOPs**（约一半）。
-3. **单设备吞吐 cuBLAS 仍更高**：gemm 12.88 GFLOPs / 3.05ms ≈ **4.2 TFLOPS**；v4 有效 6.45 GFLOPs / 2.21ms ≈ **2.9 TFLOPS**（NCU 基频口径）。
-4. **手写核赢在工作量和融合**：只算一半 + 直接适配打包输入（省掉 0.47ms 的 permute 和 75MB 临时缓冲区），端到端耗时反超。
-
-> 测速环境注意：普通基准下 cuBLAS 排在长耗时内核之后测会因 DVFS 降频变慢约 30%（如 2.54ms → 3.5ms）；NCU 锁基频则消除了该差异。引用耗时数字时需注明口径。
+1. **计算量口径不同**：cuBLAS 算全矩阵 **12.88 GFLOPs**；手写核只算下三角，有效 **6.45 GFLOPs**（约一半）。
+2. **单设备吞吐 cuBLAS 仍然更高**：gemm 12.88 GFLOPs / 3.05ms ≈ **4.2 TFLOPS**；v4 有效 6.45 GFLOPs / 2.21ms ≈ **2.9 TFLOPS**（NCU 口径）。
+3. **手写核赢在工作量和融合**：只算一半 + 直接适配打包输入（省掉 0.47ms 的 permute），端到端耗时反超。
 
 ---
 
 ## 后续优化方向
 
-1. **Tensor Core**：用 WMMA/CUTLASS 让 GEMM 走张量核（FP16/BF16 或 TF32），同时在输出阶段应用三角掩码；注意这是另一条精度路径。
+1. **Tensor Core**：用 WMMA/CUTLASS 让 GEMM 走张量核（FP16/BF16 或 TF32），同时在输出阶段应用三角掩码；这是另一条路径。
 2. **算子融合**：三角矩阵乘天然位于 Softmax 之前，与 `softmax`、`@V` 融合进 SRAM 即 Flash Attention，可彻底消除 `T×T` 分数矩阵的全局内存往返，见本仓库 attention 目录。

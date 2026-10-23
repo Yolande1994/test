@@ -35,7 +35,7 @@ S = Q @ Kᵀ × (1/√HS)
 
 > 本仓库测试基准全环境统一，所有性能数据均采集自 Nsight Compute（`ncu --set full --cache-control all`）。NCU 单次采集含硬件计数器采样开销，绝对耗时略高于干净执行，跨版本结论基于同口径下的相对比较与硬件利用率指标。（详见根目录 README）
 >
-> 默认测试配置：**FP32**，`B=8`，`T=1024`，`C=768`，`NH=12`，`HS=64`。测试过程重复 100 次取平均
+> 默认测试配置：FP32，`B=8`，`T=1024`，`C=768`，`NH=12`，`HS=64`。测试过程重复 100 次取平均
 
 ![NCU 实测](images/trimat.png)
 
@@ -53,15 +53,17 @@ S = Q @ Kᵀ × (1/√HS)
 
 ---
 
+<br>
+
 ## v0 — cuBLAS 基准：全矩阵 GEMM + 前置 permute
 
 ### 整体流程
 
 ```
-1.打包输入 inp (B,T,3,NH,HS)
-2.用 permute_kernel 维度重排 + 拆分成三个独立张量 q/k/v (B,NH,T,HS)
-3.cublasSgemmStridedBatched：B*NH 个小 GEMM 并行
-4.完整输出 preatt (B,NH,T,T) —— 含上三角，cuBLAS 不做因果跳过
+1. 打包输入 inp (B,T,3,NH,HS)
+2. 用 permute_kernel 维度重排 + 拆分成三个独立张量 q/k/v (B,NH,T,HS)
+3. cublasSgemmStridedBatched：B*NH 个小 GEMM 并行
+4. 完整输出 preatt (B,NH,T,T) —— 含上三角，cuBLAS 不做因果跳过
 ```
 
 ### 为什么先做 permute（维度重排）
@@ -97,15 +99,16 @@ cublasSgemmStridedBatched(cublas_handle,
 
 1. **无三角优化**：算完整 `T×T`，上三角约一半算力被浪费，之后还要再次掩码；
 2. **额外搬运消耗**：前置 permute 实测 0.47ms，占用一块临时缓冲区；
-3. **通用极致优化**：GEMM 内核 Compute 70.12% / Memory 92.05% 双高，是手写内核的参照标尺；
+3. **通用极致优化**：GEMM 内核性能非常高，是手写内核的参照标尺；
+4. **缩放因子融合**：直接把注意力的 1/√HS 缩放作为 alpha 参数融合到矩阵乘法里，不用额外再做一次全矩阵缩放
 
 <br>
 
 ---
 
-## 手写内核通用框架：模板 + 8×8 线程瓦片
+## 手写内核通用框架：模板 + 8×8 线程块
 
-v1~v4 共用同一套调度框架（模板 + 函数指针），差异只封装在「一个线程如何算自己的 8×8 输出瓦片」里。
+v1~v4 共用同一套调度框架（模板 + 函数指针），差异只封装在「一个线程如何算自己的 8×8 输出块」里。
 
 - **Block 划分**：把 `T×T` 输出切成 128×128 的大块，Grid = `(T/128, T/128, B*NH)`；
 - **线程划分**：Block = `(16, 16)` = 256 线程，每个线程负责 8×8 个输出（16×8=128）；
@@ -122,6 +125,7 @@ __global__ void __launch_bounds__(256, 2) trimul_global(float* out, const float*
     if (blockIdx.y > blockIdx.x) return;        // 块级掩码：整块在上三角直接退出
     int C3 = C * 3, HS = C / NH;
     float scale = 1.0f / sqrtf(HS);
+    // 将「批次 B × 注意力头 NH」维度放到 block 的 z 轴索引上
     int b  = blockIdx.z / NH;
     int nh = blockIdx.z % NH;
     // 直接从打包输入定位 Q/K 基址，无需 permute
@@ -132,7 +136,7 @@ __global__ void __launch_bounds__(256, 2) trimul_global(float* out, const float*
 }
 ```
 
-> 对角块（`blockIdx.x == blockIdx.y`）会有部分 8×8 瓦片跨过对角线。代码没有对瓦片内的上三角元素逐个跳过（那需要 `if` 分支），而是用极少量无效计算换无分支的执行效率——多算的元素本就不写掩码值，校验时会被忽略。
+> 对角块（`blockIdx.x == blockIdx.y`）会有部分 8×8 块跨过对角线。
 
 <br>
 
@@ -160,6 +164,8 @@ __device__ void matmul_tri_naive(float* p, int PS, const float* k, int KS,
     }
 }
 ```
+
+> 代码没有对瓦片内的上三角元素逐个跳过（那需要 `if` 分支），而是用极少量无效计算换无分支的执行效率——多算的元素不写掩码值，校验时会被忽略。
 
 ### 问题
 

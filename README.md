@@ -47,7 +47,7 @@ S = Q @ Kᵀ × (1/√HS)
 | v3 | float4 向量化加载 + 写回 | 3.28 | 30.88 | 96.20 | 128 | 8,8,96 | 16,16,1 |
 | v4 | 共享内存 128×32 分块 | 2.21 | 72.29 | 72.29 | 102 | 8,8,96 | 16,16,1 |
 
-> v0 实际启动两个 kernel：`permute_kernel`（0.47ms，18 寄存器，Grid 24576×1×1，Block 256×1×1）和 cuBLAS 内部的 `magma_sgemmEx_kernel`（3.05ms，表中指标取该 GEMM 内核）。
+> v0 实际启动两个 kernel：`permute_kernel`（0.47ms）和 cuBLAS 内部的 `magma_sgemmEx_kernel`（3.05ms，表中指标取该 GEMM 内核）。
 >
 > v1~v4 每个 kernel 只启动一个 `trimul_global`，Grid 的 z=96 = B×NH，每个 (x,y) 块负责一个 128×128 输出区域。
 
@@ -176,6 +176,8 @@ __device__ void matmul_tri_naive(float* p, int PS, const float* k, int KS,
 
 ## v2 — 循环重排 + 寄存器复用
 
+**设计思路**
+
 v1 的点积顺序是「按输出元素组织」，每算一个元素读两行。
 
 v2 把循环顺序改成「按公共特征维 `hs` 组织」：
@@ -221,10 +223,9 @@ __device__ void matmul_tri_registers(float* p, int PS, const float* k, int KS,
 
 **性能表现**：47.42ms → 7.21ms，快约 6.6 倍。
 
-**缺点**：
+**标量加载**：每次只读 1 个 float，没有完善带宽问题（Memory 88.51%），下版本解决。
 
-1. **标量加载**：每次只读 1 个 float，没有解决带宽问题（Memory 88.51%），下版本解决。
-2. **寄存器上限**：128 寄存器/线程，恰好是 `__launch_bounds__(256, 2)` 的编译器分配上限，再扩大瓦片会压低占用率。
+**寄存器上限**：128 寄存器/线程，恰好是 "`__launch_bounds__(256, 2)`：128 寄存器/线程" 的编译器分配上限，若再扩大单线程负责的元素数量，就会压低占用率。
 
 <br>
 
@@ -232,15 +233,18 @@ __device__ void matmul_tri_registers(float* p, int PS, const float* k, int KS,
 
 ## v3 — float4 向量化：把 128 位合并访存打满
 
-### 设计思路
+**设计思路**
 
-v2 的计算部分已无浪费，瓶颈在访存指令的合并度。v3 改用 `float4`：一次加载/存储 4 个连续 float（16 字节），让 Warp 内的访问拼成连续的 128 位块，硬件可以完美合并；访存指令数同时降到 1/4。
+v2 的计算部分已无浪费，瓶颈在访存指令的合并度。
+
+v3 改用 `float4`：一次加载/存储 4 个连续 float（16 字节），让 Warp 内的访问拼成连续的 128 位块，硬件可以完美合并；访存指令数同时降到 1/4。
 
 向量化只能在内存连续的维度做：这里最内层特征维 `hs` 连续，所以循环步长改为 4；`u` 行方向是跨步的，不能向量化。
 
 ```cuda
+// 步长从 1 变成 4，一次处理 4 个特征维
 for (int hs = 0; hs < HS; hs += 4) {
-    float4 rhs[8];
+    float4 rhs[8];     // 数据类型：float4
     for (int u = 0; u < 8; ++u)
         rhs[u] = ld_vec(k + u * KS + hs);     // 一次加载 K 行的 4 个连续特征维
     for (int i = 0; i < 8; ++i) {
@@ -254,17 +258,23 @@ for (int hs = 0; hs < HS; hs += 4) {
     }
 }
 // 写回同样 float4 向量化（j += 4，st_vec）
+for (int i = 0; i < 8; ++i) {
+    for (int j = 0; j < 8; j += 4) { // 列步长改为 4，一次写 4 个连续输出元素
+        float4 result;
+        result.x = vals[i][j + 0] * alpha;
+        result.y = vals[i][j + 1] * alpha;
+        result.z = vals[i][j + 2] * alpha;
+        result.w = vals[i][j + 3] * alpha;
+        st_vec(p + i * PS + j, result);
+    }
+}
 ```
 
-> 注意 Q 的 `lhs` 放在 `i` 循环内而不是和 `rhs` 一起放外层：它只在当前行的 8 次列循环里复用，用完即弃。若放外层需要 8 个 float4（32 个寄存器），现在只需 1 个（4 个寄存器），省 28 个寄存器且复用次数不变。
+> Q 的 `lhs` 放在 `i` 循环内而不是和 `rhs` 一起放外层：它只在当前行的 8 次列循环里复用，用完即弃。若放外层需要 8 个 float4（32 个寄存器），现在只需 1 个（4 个寄存器），省 28 个寄存器且复用次数不变。
 
-### 性能表现
+**性能**：7.21ms → 3.28ms，快约 2.2 倍。
 
-7.21ms → **3.28ms，快约 2.2 倍**。
-
-### 现存问题
-
-Memory 仍高达 96.20%——数据还是直接从全局显存读，每一遍 `hs` 循环都要重新搬 Q/K。瓦片没有在更快的存储层级上复用。
+**问题**：Memory 仍高达 96.20%，数据还是直接从全局显存读，每一遍 `hs` 循环都要重新搬 Q/K。线程块没有在更快的存储层级上复用。
 
 <br>
 

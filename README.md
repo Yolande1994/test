@@ -100,7 +100,7 @@ cublasSgemmStridedBatched(cublas_handle,
 1. **无三角优化**：算完整 `T×T`，上三角约一半算力被浪费，之后还要再次掩码；
 2. **额外搬运消耗**：前置 permute 实测 0.47ms，占用一块临时缓冲区；
 3. **通用极致优化**：GEMM 内核性能非常高，是手写内核的参照标尺；
-4. **缩放因子融合**：直接把注意力的 1/√HS 缩放作为 alpha 参数融合到矩阵乘法里，不用额外再做一次全矩阵缩放
+4. **缩放因子融合**：直接把注意力的 1/√HS 缩放作为 alpha 参数融合到矩阵乘法里，不用额外再做一次全矩阵缩放。
 
 <br>
 
@@ -225,7 +225,7 @@ __device__ void matmul_tri_registers(float* p, int PS, const float* k, int KS,
 
 **标量加载**：每次只读 1 个 float，带宽利用率提升有限，下版本解决。
 
-**寄存器上限**：128 寄存器/线程，恰好是 `__launch_bounds__(256, 2)` 下的编译器分配上限，若再扩大单线程负责的元素数量，就会压低占用率。
+**寄存器上限**：128 寄存器/线程，恰好是 `__launch_bounds__(256, 2)` 下的编译器分配上限，若再扩大单线程负责的元素数量，编译器超 128 会 spill 溢出到 local memory，性能下降。
 
 <br>
 
@@ -242,6 +242,8 @@ v3 改用 `float4`：一次加载/存储 4 个连续 float（16 字节），让 
 向量化只能在内存连续的维度做：这里最内层特征维 `hs` 连续，所以循环步长改为 4；`u` 行方向是跨步的，不能向量化。
 
 ```cuda
+// `ld_vec`/`st_vec` 封装了 float4 的读写，提升可读性
+
 // 步长从 1 变成 4，一次处理 4 个特征维
 for (int hs = 0; hs < HS; hs += 4) {
     float4 rhs[8];     // 数据类型：float4
@@ -296,7 +298,7 @@ for (int i = 0; i < 8; ++i) {
 ```cuda
 __device__ void matmul_tri4(float* p, int PS, const float* k, int KS, const float* q, int QS, int T, int HS, float alpha) {
     int i_base = blockIdx.x * 128 + threadIdx.x * 8;   // 本线程负责的 8 个 Q 行
-    int j_base = blockIdx.y * 128 + threadIdx.y * 8;   // 本线程负责的 8 个 K 
+    int j_base = blockIdx.y * 128 + threadIdx.y * 8;   // 本线程负责的 8 个 K
     // 块级掩码：整块都在上三角才退出。不能像 v1~v3 那样在顶部做 8×8 线程级退出（原因下面讲）。
     if (blockIdx.y > blockIdx.x) return;
     // 指针平移到整个线程块负责的 128 行起始位置（不再是本线程的 8 行），加载阶段搬的是整块数据
@@ -364,7 +366,7 @@ v4 的加载是整个 block 全部线程一起搬，每线程固定负责总数�
 
 ![8 × 8 瓦片](images/trimat_v4.png)
 
-**性能表现**
+**性能表现**：
 
 3.28ms → 2.21ms，快约 1.5 倍。
 

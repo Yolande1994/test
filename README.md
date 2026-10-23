@@ -61,12 +61,12 @@ S = Q @ Kᵀ × (1/√HS)
 
 ```
 1. 打包输入 inp (B,T,3,NH,HS)
-2. 用 permute_kernel 维度重排 + 拆分成三个独立张量 q/k/v (B,NH,T,HS)
+2. 先用 permute_kernel 维度重排 + 拆分成三个独立张量 q/k/v (B,NH,T,HS)
 3. cublasSgemmStridedBatched：B*NH 个小 GEMM 并行
 4. 完整输出 preatt (B,NH,T,T) —— 含上三角，cuBLAS 不做因果跳过
 ```
 
-### 为什么先做 permute（维度重排）
+**为何先做 permute（维度重排）**
 
 `cublasSgemmStridedBatched` 要求 Q/K/V 是三个独立、连续的张量，且批量维度在前——每个头的 `(T,HS)` 小矩阵必须在内存里连续，才能被当成一个批量。
 
@@ -136,8 +136,6 @@ __global__ void __launch_bounds__(256, 2) trimul_global(float* out, const float*
 }
 ```
 
-> 对角块（`blockIdx.x == blockIdx.y`）会有部分 8×8 块跨过对角线。
-
 <br>
 
 ---
@@ -165,13 +163,10 @@ __device__ void matmul_tri_naive(float* p, int PS, const float* k, int KS,
 }
 ```
 
-> 代码没有对瓦片内的上三角元素逐个跳过（那需要 `if` 分支），而是用极少量无效计算换无分支的执行效率——多算的元素不写掩码值，校验时会被忽略。
+**问题**
 
-### 问题
-
-1. **Q/K 行被重复读取**：算 8 个输出列时，同一 Q 行被读 8 次；算 8 个输出行时，同一 K 行被读 8 次。全局显存读取量是理论值的 8 倍。
-2. **跨步访存，合并度低**：Q/K 行取自打包输入，相邻行步长 `C3 = 3*C = 2304` 个元素，Warp 内线程访问的地址严重离散。
-3. **公共维度在最内层**：每次点积都要从全局内存重新发起读，访存延迟无法被计算掩盖。
+- **Q/K 行被重复读取**：算 8 个输出列时，同一 Q 行被读 8 次；算 8 个输出行时，同一 K 行被读 8 次。
+- **公共维度在最内层**：每次点积都要从全局内存重新发起读，访存延迟无法被计算掩盖。
 
 > Memory Throughput **98.24%**、Compute 仅 23.75%——DRAM 带宽已经被打满，计算单元大量时间在干等数据，典型的内存受限。
 
@@ -179,12 +174,11 @@ __device__ void matmul_tri_naive(float* p, int PS, const float* k, int KS,
 
 ---
 
-## v2 — 寄存器复用：循环重排，每个元素只读 1 次
+## v2 — 循环重排 + 寄存器复用
 
-### 设计思路
+v1 的点积顺序是「按输出元素组织」，每算一个元素读两行。
 
-v1 的点积顺序是「按输出元素组织」，每算一个元素读两行。v2 把循环顺序改成「按公共特征维 `hs` 组织」：
-
+v2 把循环顺序改成「按公共特征维 `hs` 组织」：
 1. 对每个特征维 `hs`，把 8 个 Q 行和 8 个 K 行的该维元素一次性加载到寄存器数组 `lhs[8]` / `rhs[8]`；
 2. 在寄存器内完成 8×8 = 64 次乘加累加；
 3. 走完整个 `HS` 后统一写回。
@@ -197,31 +191,40 @@ __device__ void matmul_tri_registers(float* p, int PS, const float* k, int KS,
     int i_base = blockIdx.x * 128 + threadIdx.x * 8;
     int j_base = blockIdx.y * 128 + threadIdx.y * 8;
     if (j_base > i_base) return;
-    q += i_base * QS; k += j_base * KS; p += i_base * PS + j_base;
+    // 将指针偏移到当前线程负责区域的位置
+    q += i_base * QS; 
+    k += j_base * KS;
+    p += i_base * PS + j_base;
 
-    float vals[8][8] = {};                 // 8×8 结果常驻寄存器
-    for (int hs = 0; hs < HS; ++hs) {
-        float lhs[8], rhs[8];
+    float vals[8][8] = {};               // 8×8 结果常驻寄存器
+    for (int hs = 0; hs < HS; ++hs) {    // 外层公共维度循环
+        float lhs[8];
+        float rhs[8];
         for (int u = 0; u < 8; ++u) {
-            lhs[u] = q[u * QS + hs];      // 一次读 8 个 Q 行的当前特征维
-            rhs[u] = k[u * KS + hs];      // 一次读 8 个 K 行的当前特征维
+            lhs[u] = q[u * QS + hs];     // 一次读 8 个 Q 行的当前特征维
+            rhs[u] = k[u * KS + hs];     // 一次读 8 个 K 行的当前特征维
         }
+        // 寄存器内完成 8×8=64 次乘加累加
         for (int i = 0; i < 8; ++i)
             for (int j = 0; j < 8; ++j)
-                vals[i][j] += lhs[i] * rhs[j];   // 64 次乘加，16 次加载
+                vals[i][j] += lhs[i] * rhs[j];
     }
-    // 统一写回 64 个结果（略）
+
+    // 写回 64 个结果
+    for (int i = 0; i < 8; ++i) {
+        for (int j = 0; j < 8; ++j) {
+            p[i * PS + j] = vals[i][j] * alpha;
+        }
+    }
 }
 ```
 
-### 性能表现
+**性能表现**：47.42ms → 7.21ms，快约 6.6 倍。
 
-47.42ms → **7.21ms，快约 6.6 倍**。
+**缺点**：
 
-### 现存问题
-
-1. **标量加载，合并度仍然低**：每次只读 1 个 float，而 Warp 内不同线程访问的是不同 `u` 行的元素，行之间步长 `C3` 很大，地址依然离散，带宽利用率提升有限（Memory 88.51%）。
-2. **寄存器顶到上限**：128 寄存器/线程，恰好是 `__launch_bounds__(256, 2)` 的编译器分配上限，再扩大瓦片会压低占用率。
+1. **标量加载**：每次只读 1 个 float，没有解决带宽问题（Memory 88.51%），下版本解决。
+2. **寄存器上限**：128 寄存器/线程，恰好是 `__launch_bounds__(256, 2)` 的编译器分配上限，再扩大瓦片会压低占用率。
 
 <br>
 
